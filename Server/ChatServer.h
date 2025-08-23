@@ -1,17 +1,19 @@
 #pragma once
 
 #include <string>
-#include <thread>
 #include <vector>
 #include <memory>
-#include <atomic>
-#include <mutex>
+#include <unordered_map>
 
 #include "winsock2.h"
 
 class ClientSession;
 
-class ChatServer 
+/// <summary>
+/// Chat server that accepts TCP connections and multiplexes client I/O using select().
+/// Owns all ClientSession instances and broadcasts incoming messages to other clients.
+/// </summary>
+class ChatServer
 {
 public:
   ChatServer(const std::vector<std::string>& ips, const std::string& port);
@@ -22,19 +24,30 @@ public:
   void BroadcastMsg(const std::string& msg, ClientSession* pSender);
 
 private:
-  void AcceptClients(SOCKET socket);
-  void PrintSockaddr(const sockaddr* addr);
+  // Server high-level loop:
+
+  void RunEventLoop();
+  void BuildReadSet(fd_set& outReadSet);
+  int WaitForEvents(fd_set& inOutReadSet, long timeoutMillis);
+  void HandleReadyListeners(const fd_set& readSet);
+  void HandleReadyClients(const fd_set& readSet);
+  void RemoveClosedClients();
+
+  // LifeCycle helpers:
+
+  SOCKET CreateListeningSocket(const std::string& ip);
+  void AddClient(SOCKET s);
+  void RemoveClient(SOCKET s, const char* reason);
 
 private:
-  SOCKET CreateListeningSocket(const std::string& ip);
-
+  bool m_wsaInit = false;
   std::string m_port;
   std::vector<std::string> m_ips;
   std::vector<SOCKET> m_listenSockets;
 
-  std::atomic<bool> m_running;
-  std::vector<std::thread> m_acceptThreads;
+  // Key: SOCKET handle for O(1) lookup/erase.
+  std::unordered_map<SOCKET, std::unique_ptr<ClientSession>> m_clients;
 
-  std::vector<std::shared_ptr<ClientSession>> m_clients;
-  std::mutex m_clientsMutex;
+  // stash of sockets scheduled for removal after a loop tick
+  std::vector<SOCKET> m_toClose;
 };

@@ -13,7 +13,6 @@ ClientSession::ClientSession(SOCKET socket, ChatServer* server)
 {
   m_socket = socket;
   m_server = server;
-  m_active.store(false, std::memory_order_release);
 }
 
 ClientSession::~ClientSession()
@@ -21,17 +20,8 @@ ClientSession::~ClientSession()
   Stop();
 }
 
-void ClientSession::Start()
-{
-  m_active.store(true, std::memory_order_release);
-
-  m_thread = std::thread(&ClientSession::ReceiveMsg, this);
-}
-
 void ClientSession::Stop()
 {
-  m_active.store(false, std::memory_order_release);
-
   if (m_socket != INVALID_SOCKET)
   {
     GracefulShutdown();
@@ -39,11 +29,9 @@ void ClientSession::Stop()
     closesocket(m_socket);
     m_socket = INVALID_SOCKET;
   }
-
-  if (m_thread.joinable())
-    m_thread.join();
 }
 
+// Shutdown, but allow read all remaining.
 void ClientSession::GracefulShutdown()
 {
   shutdown(m_socket, SD_SEND);
@@ -51,13 +39,24 @@ void ClientSession::GracefulShutdown()
     reinterpret_cast<const char*>(&RECV_TIMEOUT), sizeof(RECV_TIMEOUT));
 
   char buf[RECV_BUF];
-  while (recv(m_socket, buf, sizeof(buf), 0) > 0) { /* Do nothing */ }
+  while (true)
+  {
+    int bytes = recv(m_socket, buf, sizeof(buf), 0);
+
+    if (bytes == 0)
+      break; // peer closed connection
+
+    if (bytes < 0)
+    {
+      // e == WSAEWOULDBLOCK could be returned
+      //int e = WSAGetLastError();
+      break;
+    }
+  }
 }
 
 void ClientSession::SendMsg(const string& msg)
 {
-  std::lock_guard<std::mutex> lock(m_sendMutex);
-
   const char* ptr = msg.data();
   size_t size = msg.size();
 
@@ -73,18 +72,29 @@ void ClientSession::SendMsg(const string& msg)
   }
 }
 
-void ClientSession::ReceiveMsg()
+// 0 - peer closed connection
+// 1 - no data right now
+// -1 - error occured
+// int - num of bytes read
+int ClientSession::ReceiveMsg()
 {
   char buf[RECV_BUF];
+  int bytes = recv(m_socket, buf, sizeof(buf), 0);
 
-  while (m_active.load(std::memory_order_acquire))
+  if (bytes == 0)
+    return 0; // closed connection
+
+  if (bytes < 0)
   {
-    int bytes = recv(m_socket, buf, sizeof(buf), 0);
+    int e = WSAGetLastError();
+    if (e == WSAEWOULDBLOCK || e == WSAEINTR)
+      return 1; // no data right now
 
-    if (bytes <= 0)
-      break;
-
-    std::string msg(buf, bytes);
-    m_server->BroadcastMsg(msg, this);
+    return -1; // Error
   }
+
+  std::string msg(buf, bytes);
+  m_server->BroadcastMsg(msg, this);
+
+  return bytes;
 }
