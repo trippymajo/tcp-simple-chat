@@ -1,8 +1,7 @@
 #pragma once
 
-#include <thread>
-#include <atomic>
 #include <string>
+#include <deque>
 
 #include "winsock2.h"
 
@@ -12,18 +11,26 @@ public:
   ChatClient(const char* ipadd, const char* port);
   ~ChatClient() {};
 
-  void Run();
+  void Start();
+  void Stop();
+  void EnqueueSend(std::string line);
 
 private:
-  void ReceiveMessages();
-  void Disconnect();
-  void SendMessages();
-  void GracefulShutDown();
+  bool CreateConnection();
+  bool ConnectToServer(SOCKET socket, addrinfo* pInfo);
+  void RunEventLoop();
+  void BuildFdSets(fd_set& rset, fd_set& wset);
+  int WaitForEvents(fd_set& rset, fd_set& wset);
+  bool HandleReadyReceivers(const fd_set& readSet);
+  bool HandleReadyWriters(const fd_set& writeSet);
+  int ReceiveMsg();
+  int SendMsg();
 
 private:
-  std::atomic<bool> m_isActive;
+  bool m_isActive;
   std::string m_port;
   std::string m_ipadd;
   SOCKET m_socket;
-  std::thread m_recv;
+  struct Pending { std::string data; size_t ofs = 0; };
+  std::deque<Pending> m_sendQ;
 };

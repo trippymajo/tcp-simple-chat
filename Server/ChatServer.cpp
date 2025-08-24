@@ -236,12 +236,17 @@ void ChatServer::RunEventLoop()
 void ChatServer::BuildReadSet(fd_set& outReadSet)
 {
   FD_ZERO(&outReadSet);
-  for (SOCKET ls : m_listenSockets) {
-    if (ls != INVALID_SOCKET) FD_SET(ls, &outReadSet);
+  for (SOCKET ls : m_listenSockets) 
+  {
+    if (ls != INVALID_SOCKET)
+     FD_SET(ls, &outReadSet);
   }
-  for (const auto& kv : m_clients) {
+
+  for (const auto& kv : m_clients) 
+  {
     SOCKET s = kv.first;
-    if (s != INVALID_SOCKET) FD_SET(s, &outReadSet);
+    if (s != INVALID_SOCKET)
+     FD_SET(s, &outReadSet);
   }
 }
 
