@@ -10,6 +10,11 @@
 using std::cout;
 using std::cerr;
 
+// Micosoft guids
+GUID guidAcceptEx = WSAID_ACCEPTEX;
+GUID guidGetAcceptExSockaddrs = WSAID_GETACCEPTEXSOCKADDRS;
+
+constexpr int ACCEPT_DEPTH = 4;
 constexpr int MAX_LISTEN = 64; // backlog (Num of clients)
 constexpr long DEFAULT_TICK_MS = 1000; // 1s tick to check stop flag
 
@@ -28,23 +33,6 @@ static void SafeCloseSocket(SOCKET& s)
     closesocket(s);
     s = INVALID_SOCKET;
   }
-}
-
-/// <summary>
-/// Puts a socket into non-blocking mode (FIONBIO = 1). Best effort.
-/// </summary>
-/// <param name="s">Socket handle.</param>
-static void SetNonBlocking(SOCKET s)
-{
-  u_long on = 1;
-  ioctlsocket(s, FIONBIO, &on);
-}
-
-/// <summary>Returns true if the last WSA error is WSAEWOULDBLOCK or WSAEINTR.</summary>
-static bool IsWouldBlock()
-{
-  int e = WSAGetLastError();
-  return (e == WSAEWOULDBLOCK || e == WSAEINTR);
 }
 
 /// <summary>
@@ -107,10 +95,7 @@ void ChatServer::Start()
   {
     SOCKET s = CreateListeningSocket(ip);
     if (s != INVALID_SOCKET) 
-    {
-      SetNonBlocking(s);
       m_listenSockets.push_back(s);
-    }
   }
 
   if (m_listenSockets.empty())
@@ -120,8 +105,25 @@ void ChatServer::Start()
     return;
   }
 
+  if (!InitIocp()) 
+  {
+    cerr << "CreateIoCompletionPort failed\n";
+    Stop();
+    return;
+  }
+
+  for (SOCKET ls : m_listenSockets)
+    AssociateHandle((HANDLE)ls, (ULONG_PTR)ls);
+
+  // Post several AcceptEx per listener
+  for (SOCKET ls : m_listenSockets)
+  {
+    for (int i = 0; i < ACCEPT_DEPTH; ++i)
+      CreateAcceptSocket(ls);
+  }
+
   m_wsaInit = true;
-  RunEventLoop();
+  RunLoop();
 
   // Ensure cleanup when the loop exits.
   Stop();
@@ -136,15 +138,24 @@ void ChatServer::Stop()
   if (!m_wsaInit && m_listenSockets.empty() && m_clients.empty())
     return;
 
+  // Close clients
+  for (auto& kv : m_clients)
+  {
+    if (kv.second) 
+      kv.second->Stop();
+  }
+  m_clients.clear();
+
+  // Close listeners
   for (auto& s : m_listenSockets)
     SafeCloseSocket(s);
   m_listenSockets.clear();
 
-  for (auto& kv : m_clients) 
+  if (m_iocp)
   {
-    if (kv.second) kv.second->Stop();
+    CloseHandle(m_iocp);
+    m_iocp == nullptr;
   }
-  m_clients.clear();
 
   WSACleanup();
   m_wsaInit = false;
@@ -171,7 +182,8 @@ SOCKET ChatServer::CreateListeningSocket(const std::string& ip)
 
   for (addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next)
   {
-    SOCKET s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+    SOCKET s = WSASocket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol,
+                         nullptr, 0, WSA_FLAG_OVERLAPPED);
     if (s == INVALID_SOCKET)
       continue;
 
@@ -193,6 +205,7 @@ SOCKET ChatServer::CreateListeningSocket(const std::string& ip)
 
     cout << "Server listening on: ";
     PrintSockaddr(ptr->ai_addr);
+
     retSocket = s;
     break;
   }
@@ -201,161 +214,200 @@ SOCKET ChatServer::CreateListeningSocket(const std::string& ip)
   return retSocket;
 }
 
+bool ChatServer::InitIocp()
+{
+  m_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+  return m_iocp != nullptr;
+}
+
+/// <summary>Associates a handle with IOCP using a completion key.</summary>
+bool ChatServer::AssociateHandle(HANDLE h, ULONG_PTR key)
+{
+  return (CreateIoCompletionPort(h, m_iocp, key, 0) == m_iocp);
+}
+
+bool ChatServer::CreateAcceptSocket(SOCKET listenSock)
+{
+  // Load AcceptEx
+  DWORD bytes = 0;
+  LPFN_ACCEPTEX pAcceptEx = nullptr;
+  if (WSAIoctl(listenSock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    &guidAcceptEx, sizeof(guidAcceptEx),
+    &pAcceptEx, sizeof(pAcceptEx),
+    &bytes, nullptr, nullptr) == SOCKET_ERROR)
+  {
+    return false;
+  }
+
+  // Load GetAcceptExSockaddrs
+  LPFN_GETACCEPTEXSOCKADDRS pGetAddrs = nullptr;
+  if (WSAIoctl(listenSock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    &guidGetAcceptExSockaddrs, sizeof(guidGetAcceptExSockaddrs),
+    &pGetAddrs, sizeof(pGetAddrs),
+    &bytes, nullptr, nullptr) == SOCKET_ERROR)
+  {
+    return false;
+  }
+
+  // Create accept socket with the same provider (clone WSAPROTOCOL_INFO)
+  WSAPROTOCOL_INFOW pi{}; int len = sizeof(pi);
+  if (getsockopt(listenSock, SOL_SOCKET, SO_PROTOCOL_INFOW,
+    reinterpret_cast<char*>(&pi), &len) == SOCKET_ERROR)
+  {
+    return false;
+  }
+
+  SOCKET a = WSASocket(pi.iAddressFamily, pi.iSocketType, pi.iProtocol, &pi, 0, WSA_FLAG_OVERLAPPED);
+  if (a == INVALID_SOCKET) 
+    return false;
+
+  // Prepare context (lives until completion)
+  auto* ctx = new AcceptCtx{};
+  ctx->listenSock = listenSock;
+  ctx->acceptSock = a;
+  ctx->pAcceptEx = pAcceptEx;
+  ctx->pGetAddrs = pGetAddrs;
+  const DWORD addrLen = sizeof(SOCKADDR_STORAGE) + 16;
+  ctx->buf.resize(2 * addrLen + 1024);
+
+  DWORD recvBytes = 0;
+  BOOL ok = pAcceptEx(listenSock, a,
+    ctx->buf.data(), 0,
+    addrLen, addrLen,
+    &recvBytes, &ctx->ex.ov);
+
+  if (!ok && WSAGetLastError() != WSA_IO_PENDING)
+  {
+    closesocket(a);
+    delete ctx;
+    return false;
+  }
+
+  return true;
+}
+
 /// <summary>Top-level select() loop broken into clear steps.</summary>
-void ChatServer::RunEventLoop()
+void ChatServer::RunLoop()
 {
-  while (m_wsaInit) 
+  while (m_wsaInit)
   {
-    fd_set readSet;
-    BuildReadSet(readSet);
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    LPOVERLAPPED pov = nullptr;
 
-    int ready = WaitForEvents(readSet, DEFAULT_TICK_MS);
-    if (!m_wsaInit) 
-      break;
+    BOOL ok = GetQueuedCompletionStatus(m_iocp, &bytes, &key, &pov, INFINITE);
 
-    if (ready == -1) 
+    if (!pov)
     {
-      if (!IsWouldBlock()) 
-      {
-        cerr << "select() failed, err=" << WSAGetLastError() << "\n";
+      //if handle closed - quit
+      if (!ok) 
         break;
-      }
       continue;
     }
 
-    if (ready == 0) 
-      continue;
-
-    HandleReadyListeners(readSet);
-    HandleReadyClients(readSet);
-    RemoveClosedClients();
-  }
-}
-
-/// <summary>Builds read fd_set from listeners + clients.</summary>
-void ChatServer::BuildReadSet(fd_set& outReadSet)
-{
-  FD_ZERO(&outReadSet);
-  for (SOCKET ls : m_listenSockets) 
-  {
-    if (ls != INVALID_SOCKET)
-     FD_SET(ls, &outReadSet);
-  }
-
-  for (const auto& kv : m_clients) 
-  {
-    SOCKET s = kv.first;
-    if (s != INVALID_SOCKET)
-     FD_SET(s, &outReadSet);
-  }
-}
-
-/// <summary>Waits on select() with a given timeout (ms). Returns ready count or SOCKET_ERROR.</summary>
-int ChatServer::WaitForEvents(fd_set& inOutReadSet, long timeoutMillis)
-{
-  timeval tv{};
-  tv.tv_sec = timeoutMillis / 1000;
-  tv.tv_usec = (timeoutMillis % 1000) * 1000;
-  // nfds is ignored on Windows; pass 0
-  return select(0, &inOutReadSet, nullptr, nullptr, &tv);
-}
-
-/// <summary>Accepts all pending clients from all ready listeners</summary>
-void ChatServer::HandleReadyListeners(const fd_set& readSet)
-{
-  for (SOCKET ls : m_listenSockets) 
-  {
-    if (ls == INVALID_SOCKET)
-      continue;
-    if (!FD_ISSET(ls, const_cast<fd_set*>(&readSet)))
-     continue;
-
-    while (true)
+    auto* ex = reinterpret_cast<OvEx*>(pov);
+    switch (ex->kind)
     {
-      SOCKET cs = accept(ls, nullptr, nullptr);
-
-      if (cs == INVALID_SOCKET)
+      case OvEx::Kind::Accept:
       {
-        if (IsWouldBlock())
-          break; // no more to accept right now
-
-        // hard error: stop accepting on this listener for this tick
+        auto* actx = reinterpret_cast<AcceptCtx*>(pov); // ex ? ?????? AcceptCtx
+        OnAcceptComplete(actx, bytes, ok != FALSE);
         break;
       }
-
-      AddClient(cs);
+      case OvEx::Kind::Recv:
+      {
+        auto* sess = reinterpret_cast<ClientSession*>(key); // key = session*
+        OnRecvComplete(sess, bytes, ok != FALSE);
+        break;
+      }
+      case OvEx::Kind::Send:
+      {
+        auto* sess = reinterpret_cast<ClientSession*>(key);
+        OnSendComplete(sess, bytes, ok != FALSE);
+        break;
+      }
     }
   }
 }
 
-/// <summary>Handles readable clients; schedules closures into m_toClose.</summary>
-void ChatServer::HandleReadyClients(const fd_set& readSet)
+/// <summary>Handles completed AcceptEx: attach socket to IOCP, start recv, repost accept.</summary>
+void ChatServer::OnAcceptComplete(AcceptCtx* ctx, DWORD /*bytes*/, bool ok)
 {
-  m_toClose.clear();
+  SOCKET as = ctx->acceptSock;
+  SOCKET ls = ctx->listenSock;
 
-  for (auto& kv : m_clients) 
+  if (!ok)
   {
-    SOCKET s = kv.first;
-    auto& client = kv.second;
-
-    if (s == INVALID_SOCKET)
-      continue;
-    if (!FD_ISSET(s, const_cast<fd_set*>(&readSet)))
-      continue;
-
-    int n = client->ReceiveMsg();
-    if (n <= 0) 
-      m_toClose.push_back(s);
-  }
-}
-
-/// <summary>Closes and erases clients collected in m_toClose.</summary>
-void ChatServer::RemoveClosedClients()
-{
-  for (SOCKET s : m_toClose)
-    RemoveClient(s, "recv <= 0");
-
-  m_toClose.clear();
-}
-
-/// <summary>Adds a newly accepted client socket; sets non-blocking, logs peer, sends greeting.</summary>
-void ChatServer::AddClient(SOCKET s)
-{
-  SetNonBlocking(s);
-
-  // Optional greeting
-  static const char* hello = "Welcome to the chat!\n";
-  send(s, hello, static_cast<int>(strlen(hello)), 0);
-
-  // Log peer address
-  sockaddr addr{}; int alen = sizeof(addr);
-  if (getpeername(s, &addr, &alen) == 0) 
-  {
-    cout << "Client connected: ";
-    PrintSockaddr(&addr);
-    cout << "\n";
-  }
-
-  m_clients.emplace(s, std::make_unique<ClientSession>(s, this));
-}
-
-/// <summary>Stops and erases a client; logs disconnect.</summary>
-void ChatServer::RemoveClient(SOCKET s, const char* reason)
-{
-  auto it = m_clients.find(s);
-  if (it == m_clients.end())
+    closesocket(as);
+    delete ctx;
     return;
-
-  sockaddr addr{}; int alen = sizeof(addr);
-  if (getpeername(s, &addr, &alen) == 0) 
-  {
-    cout << "Client disconnected (" << (reason ? reason : "n/a") << "): ";
-    PrintSockaddr(&addr);
-    cout << "\n";
   }
 
-  it->second->Stop();
-  m_clients.erase(it);
+  // Required for correct getsockname/getpeername/shutdown semantics
+  setsockopt(as, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+    reinterpret_cast<const char*>(&ls), sizeof(ls));
+
+  // (Optional) log remote endpoint
+  SOCKADDR* local = nullptr, * remote = nullptr; int lsz = 0, rsz = 0;
+  const DWORD addrLen = sizeof(SOCKADDR_STORAGE) + 16;
+  ctx->pGetAddrs(ctx->buf.data(), 0, addrLen, addrLen, &local, &lsz, &remote, &rsz);
+  cout << "Client connected: "; PrintSockaddr(remote); cout << "\n";
+
+  // Create session, associate with IOCP (key = session ptr), post first recv
+  auto sess = std::make_unique<ClientSession>(as, this);
+  AssociateHandle((HANDLE)as, reinterpret_cast<ULONG_PTR>(sess.get()));
+  if (!sess->PostRecv())
+  {
+    sess->Stop();
+    delete ctx;
+    return;
+  }
+
+  m_clients.emplace(as, std::move(sess));
+
+  // Repost a new AcceptEx on the same listener to keep backlog full
+  CreateAcceptSocket(ls);
+
+  // Free completed accept context
+  delete ctx;
+}
+
+/// <summary>Handles completed WSARecv on a session: broadcast or close.</summary>
+void ChatServer::OnRecvComplete(ClientSession* sess, DWORD bytes, bool ok)
+{
+  if (!ok || bytes == 0)
+  {
+    SOCKET s = sess->GetSocket();
+    cout << "Client disconnected\n";
+    sess->Stop();
+    m_clients.erase(s);
+    return;
+  }
+
+  // Broadcast to others (skip sender)
+  std::string msg(sess->m_recvBuf, sess->m_recvBuf + bytes);
+  BroadcastMsg(msg, sess);
+
+  // Keep receiving
+  sess->PostRecv();
+}
+
+/// <summary>Handles completed WSASend on a session: pop queue and post next if any.</summary>
+void ChatServer::OnSendComplete(ClientSession* sess, DWORD /*bytes*/, bool ok)
+{
+  if (!ok)
+  {
+    SOCKET s = sess->GetSocket();
+    sess->Stop();
+    m_clients.erase(s);
+    return;
+  }
+  if (!sess->m_sendQueue.empty())
+    sess->m_sendQueue.pop_front();
+  sess->m_sendInFlight = false;
+
+  if (!sess->m_sendQueue.empty())
+    sess->PostSend(sess->m_sendQueue.front());
 }
 
 /// <summary>
@@ -369,7 +421,7 @@ void ChatServer::BroadcastMsg(const std::string& msg, ClientSession* pSender)
   {
     const auto& up = kv.second;
     if (up && up.get() != pSender)
-      up->SendMsg(msg);
+      up->PostSend(msg);
   }
 
   cout << "Message broadcated:" << msg << "\n";

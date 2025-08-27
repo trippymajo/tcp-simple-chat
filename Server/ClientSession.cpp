@@ -1,18 +1,20 @@
 #include "ClientSession.h"
 #include "ChatServer.h"
 
-#include "WS2tcpip.h"
+#include <stdexcept>
+#include <cstring>
 
-using std::string;
-
-
-constexpr int RECV_BUF = 4096;
-constexpr int RECV_TIMEOUT = 3000;
 
 ClientSession::ClientSession(SOCKET socket, ChatServer* server)
+  : m_socket(socket), m_server(server)
 {
-  m_socket = socket;
-  m_server = server;
+  std::memset(&m_ovRecv, 0, sizeof(m_ovRecv));
+  std::memset(&m_ovSend, 0, sizeof(m_ovSend));
+  m_ovRecv.kind = OvEx::Kind::Recv;
+  m_ovSend.kind = OvEx::Kind::Send;
+
+  m_recvBufWsa.buf = m_recvBuf;
+  m_recvBufWsa.len = sizeof(m_recvBuf);
 }
 
 ClientSession::~ClientSession()
@@ -24,77 +26,48 @@ void ClientSession::Stop()
 {
   if (m_socket != INVALID_SOCKET)
   {
-    GracefulShutdown();
-
+    shutdown(m_socket, SD_BOTH);
     closesocket(m_socket);
     m_socket = INVALID_SOCKET;
   }
 }
 
-// Shutdown, but allow read all remaining.
-void ClientSession::GracefulShutdown()
+bool ClientSession::PostRecv()
 {
-  shutdown(m_socket, SD_SEND);
-  setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, 
-    reinterpret_cast<const char*>(&RECV_TIMEOUT), sizeof(RECV_TIMEOUT));
+  DWORD flags = 0;
+  DWORD ignored = 0;
+  std::memset(&m_ovRecv.ov, 0, sizeof(m_ovRecv.ov));
+  m_ovRecv.kind = OvEx::Kind::Recv;
 
-  char buf[RECV_BUF];
-  while (true)
-  {
-    int bytes = recv(m_socket, buf, sizeof(buf), 0);
-
-    if (bytes == 0)
-      break; // peer closed connection
-
-    if (bytes < 0)
-    {
-      // e == WSAEWOULDBLOCK could be returned
-      //int e = WSAGetLastError();
-      break;
-    }
-  }
+  int rc = WSARecv(m_socket, &m_recvBufWsa, 1, &ignored, &flags, &m_ovRecv.ov, nullptr);
+  if (rc == 0) return true;
+  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING) return true;
+  return false;
 }
 
-void ClientSession::SendMsg(const string& msg)
+bool ClientSession::PostSend(const std::string& msg)
 {
-  const char* ptr = msg.data();
-  size_t size = msg.size();
+  if (msg.empty()) return true;
 
-  while (size > 0)
-  {
-    int sent = send(m_socket, ptr, static_cast<int>(size), 0);
+  m_sendQueue.push_back(msg);
+  if (m_sendInFlight) return true;
 
-    if (sent <= 0)
-      break;
+  m_sendInFlight = true;
 
-    ptr += sent;
-    size -= static_cast<size_t>(sent);
-  }
-}
+  std::memset(&m_ovSend.ov, 0, sizeof(m_ovSend.ov));
+  m_ovSend.kind = OvEx::Kind::Send;
 
-// 0 - peer closed connection
-// 1 - no data right now
-// -1 - error occured
-// int - num of bytes read
-int ClientSession::ReceiveMsg()
-{
-  char buf[RECV_BUF];
-  int bytes = recv(m_socket, buf, sizeof(buf), 0);
+  WSABUF wsa{};
+  wsa.buf = const_cast<char*>(m_sendQueue.front().data());
+  wsa.len = static_cast<ULONG>(m_sendQueue.front().size());
 
-  if (bytes == 0)
-    return 0; // closed connection
+  DWORD ignored = 0;
+  int rc = WSASend(m_socket, &wsa, 1, &ignored, 0, &m_ovSend.ov, nullptr);
+  if (rc == 0) return true;
+  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING) return true;
 
-  if (bytes < 0)
-  {
-    int e = WSAGetLastError();
-    if (e == WSAEWOULDBLOCK || e == WSAEINTR)
-      return 1; // no data right now
-
-    return -1; // Error
-  }
-
-  std::string msg(buf, bytes);
-  m_server->BroadcastMsg(msg, this);
-
-  return bytes;
+  // Immediate failure
+  m_sendInFlight = false;
+  m_sendQueue.pop_front();
+  return false;
 }
