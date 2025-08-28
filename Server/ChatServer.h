@@ -8,7 +8,7 @@
 #include "winsock2.h"
 #include "mswsock.h"
 
-#include "Shared.h"
+#include "../include/Shared.h"
 
 class ClientSession;
 

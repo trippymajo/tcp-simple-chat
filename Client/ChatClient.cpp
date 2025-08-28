@@ -1,23 +1,11 @@
 #include "ChatClient.h"
 
 #include <iostream>
-#include "WS2tcpip.h"
+#include <cstring>
 
 using std::cout;
 using std::cerr;
 
-constexpr int RECV_BUF = 4096;
-constexpr int MAX_READS_PER_TICK = 20;
-constexpr long DEFAULT_TICK_MS = 1000; // 1s tick to check stop flag
-
-//
-// === UTILS ===
-//
-
-/// <summary>
-/// Safely closes a socket and sets it to INVALID_SOCKET.
-/// </summary>
-/// <param name="s">Reference to a socket handle.</param>
 static void SafeCloseSocket(SOCKET& s)
 {
   if (s != INVALID_SOCKET)
@@ -27,80 +15,94 @@ static void SafeCloseSocket(SOCKET& s)
   }
 }
 
-/// <summary>
-/// Puts a socket into non-blocking mode (FIONBIO = 1). Best effort.
-/// </summary>
-/// <param name="s">Socket handle.</param>
-static void SetNonBlocking(SOCKET s)
-{
-  u_long on = 1;
-  ioctlsocket(s, FIONBIO, &on);
-}
-
-/// <summary>Returns true if the last WSA error is WSAEWOULDBLOCK or WSAEINTR.</summary>
-static bool IsWouldBlock()
-{
-  int e = WSAGetLastError();
-  return (e == WSAEWOULDBLOCK || e == WSAEINTR);
-}
-
-//
-// === ChatServer functions ===
-//
-
 ChatClient::ChatClient(const char* ipadd, const char* port)
-  : m_ipadd(ipadd), m_port(port) {};
+  : m_ipadd(ipadd), m_port(port)
+{
+  m_recvBufWsa.buf = m_recvStorage;
+  m_recvBufWsa.len = static_cast<ULONG>(sizeof(m_recvStorage));
+}
+
+ChatClient::~ChatClient()
+{
+  Stop();
+  if (m_sendThread.joinable())
+    m_sendThread.join();
+}
 
 void ChatClient::Start()
 {
   WSADATA wsa{};
-  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) 
-  { 
-    cerr << "WSAStartup failed\n"; return; 
-  }
-  m_isActive = true;
-
-  if (!CreateConnection())
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
   {
-    cerr << "Failed to connect to " << m_ipadd << m_port << "\n";
+    cerr << "WSAStartup failed\n";
     return;
   }
 
-  RunEventLoop();
+  if (!InitIocp() || !CreateConnection() || !AssociateHandle())
+  {
+    Stop();
+    return;
+  }
 
+  m_isActive = true;
+
+  if (!PostRecv())
+  {
+    cerr << "Initial WSARecv failed\n";
+    Stop();
+    return;
+  }
+
+  m_runSend = true;
+  m_sendThread = std::thread([this] { SendWorker(); });
+
+  RunEventLoop();
   Stop();
 }
 
 void ChatClient::Stop()
 {
+  m_runSend = false;
+  m_sendCv.notify_all();
+
   if (m_socket != INVALID_SOCKET)
     shutdown(m_socket, SD_BOTH);
 
   SafeCloseSocket(m_socket);
 
   if (m_isActive)
-  { 
+  {
     WSACleanup();
     m_isActive = false;
   }
+
+  if (m_sendThread.joinable())
+    m_sendThread.join();
+}
+
+bool ChatClient::InitIocp()
+{
+  m_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+  return m_iocp != nullptr;
 }
 
 bool ChatClient::CreateConnection()
 {
-  addrinfo hints{}, *result;
+  addrinfo hints{}, * result;
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_protocol = IPPROTO_TCP;
 
   if (getaddrinfo(m_ipadd.c_str(), m_port.c_str(), &hints, &result) != 0)
   {
-    cerr << "Cant resolve address for " << m_ipadd << m_port << "\n";
+    cerr << "Cant resolve address for " << m_ipadd << ":" << m_port << "\n";
     return false;
   }
 
   for (addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next)
   {
-    SOCKET s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+    SOCKET s = WSASocket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol,
+      nullptr, 0, WSA_FLAG_OVERLAPPED);
     if (s == INVALID_SOCKET)
       continue;
 
@@ -110,12 +112,12 @@ bool ChatClient::CreateConnection()
       continue;
     }
 
-    SetNonBlocking(s);
-
     m_socket = s;
+    freeaddrinfo(result);
     return true;
   }
 
+  freeaddrinfo(result);
   return false;
 }
 
@@ -130,148 +132,183 @@ bool ChatClient::ConnectToServer(SOCKET socket, addrinfo* pInfo)
   return true;
 }
 
+bool ChatClient::AssociateHandle()
+{
+  return (CreateIoCompletionPort((HANDLE)m_socket, m_iocp, (ULONG_PTR)m_socket, 0) == m_iocp);
+}
+
+bool ChatClient::PostSend(const std::string& msg)
+{
+  if (msg.empty())
+    return true;
+
+  std::lock_guard<std::mutex> lg(m_sendMx);
+  m_sendQueue.push_back(SendItem{ msg, 0 });
+
+  if (m_sendInFlight)
+    return true;
+
+  m_sendInFlight = true;
+  return KickSend();
+}
+
+bool ChatClient::KickSend()
+{
+  std::lock_guard<std::mutex> lg(m_sendMx);
+  if (m_sendQueue.empty())
+  {
+    m_sendInFlight = false;
+    return true;
+  }
+
+  if (m_socket == INVALID_SOCKET)
+  {
+    m_sendInFlight = false;
+    m_sendQueue.clear();
+    return false;
+  }
+
+  SendItem& it = m_sendQueue.front();
+
+  std::memset(&it.ov.ov, 0, sizeof(it.ov.ov));
+  it.ov.kind = OvEx::Kind::Send;
+
+  WSABUF wsa{};
+  wsa.buf = const_cast<char*>(it.data.data() + it.off);
+  wsa.len = static_cast<ULONG>(it.data.size() - it.off);
+
+  DWORD ignored = 0;
+  int rc = WSASend(m_socket, &wsa, 1, &ignored, 0, &it.ov.ov, nullptr);
+
+  if (rc == 0)
+    return true;
+
+  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING)
+    return true;
+
+  m_sendInFlight = false;
+  m_sendQueue.pop_front();
+  return false;
+}
+
+bool ChatClient::PostRecv()
+{
+  std::memset(&m_ovRecv.ov, 0, sizeof(m_ovRecv.ov));
+  m_ovRecv.kind = OvEx::Kind::Recv;
+
+  DWORD flags = 0, ig = 0;
+  int rc = WSARecv(m_socket, &m_recvBufWsa, 1, &ig, &flags, &m_ovRecv.ov, nullptr);
+  if (rc == 0)
+    return true;
+  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING)
+    return true;
+
+  return false;
+}
+
+bool ChatClient::Send(const std::string& msg)
+{
+  if (msg.empty())
+    return true;
+
+  {
+    std::lock_guard<std::mutex> lg(m_sendMx);
+    m_sendQueue.push_back(SendItem{ msg, 0 });
+  }
+  m_sendCv.notify_one();
+  return true;
+}
+
+void ChatClient::SendWorker()
+{
+  while (m_runSend)
+  {
+    std::unique_lock<std::mutex> lk(m_sendMx);
+    m_sendCv.wait(lk, [&] { return !m_sendQueue.empty() || !m_runSend; });
+
+    if (!m_runSend) break;
+    if (!m_sendInFlight && !m_sendQueue.empty())
+    {
+      m_sendInFlight = true;
+      lk.unlock();
+      KickSend();
+    }
+  }
+}
+
 void ChatClient::RunEventLoop()
 {
   while (m_isActive)
   {
-    fd_set readSet, writeSet;
-    BuildFdSets(readSet, writeSet);
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    LPOVERLAPPED pov = nullptr;
 
-    int ready = WaitForEvents(readSet, writeSet);
+    BOOL ok = GetQueuedCompletionStatus(m_iocp, &bytes, &key, &pov, INFINITE);
 
-    if (!m_isActive)
+    if (!pov)
       break;
 
-    if (ready == -1)
+    auto* ex = reinterpret_cast<OvEx*>(pov);
+    switch (ex->kind)
     {
-      if (!IsWouldBlock())
-      {
-        cerr << "select() failed, err=" << WSAGetLastError() << "\n";
-        break;
-      }
-      continue;
+    case OvEx::Kind::Recv: OnRecvComplete(bytes, ok != FALSE); break;
+    case OvEx::Kind::Send: OnSendComplete(bytes, ok != FALSE); break;
+    }
+  }
+}
+
+void ChatClient::OnRecvComplete(DWORD bytes, bool ok)
+{
+  if (!ok || bytes == 0)
+  {
+    cout << "Server closed connection\n";
+    SafeCloseSocket(m_socket);
+    if (m_iocp)
+      PostQueuedCompletionStatus(m_iocp, 0, 0, nullptr);
+    return;
+  }
+
+  std::string msg(m_recvStorage, m_recvStorage + bytes);
+  cout << msg;
+
+  PostRecv();
+}
+
+void ChatClient::OnSendComplete(DWORD bytes, bool ok)
+{
+  if (!ok)
+  {
+    SafeCloseSocket(m_socket);
+    if (m_iocp)
+      PostQueuedCompletionStatus(m_iocp, 0, 0, nullptr);
+    return;
+  }
+
+  bool needKick = false;
+  {
+    std::lock_guard<std::mutex> lg(m_sendMx);
+    if (m_sendQueue.empty())
+    {
+      m_sendInFlight = false;
+      return;
     }
 
-    if (ready == 0) // Timeout
-      continue;
+    SendItem& it = m_sendQueue.front();
+    it.off += bytes;
 
-    if (!HandleReadyReceivers(readSet))
-      break;
-
-    if (!HandleReadyWriters(writeSet))
-      break;
-  }
-}
-
-void ChatClient::BuildFdSets(fd_set& rset, fd_set& wset)
-{
-  FD_ZERO(&rset); FD_ZERO(&wset);
-
-  if (m_socket != INVALID_SOCKET)
-  {
-    FD_SET(m_socket, &rset);
-
-    if (!m_sendQ.empty())
-      FD_SET(m_socket, &wset);
-  }
-}
-
-int ChatClient::WaitForEvents(fd_set& rset, fd_set& wset)
-{
-  timeval tv{};
-  tv.tv_sec = DEFAULT_TICK_MS / 1000;
-  tv.tv_usec = (DEFAULT_TICK_MS % 1000) * 1000;
-  // nfds is ignored on Windows; pass 0
-  return select(0, &rset, &wset, nullptr, &tv);
-}
-
-bool ChatClient::HandleReadyReceivers(const fd_set& readSet)
-{
-  if (!FD_ISSET(m_socket, const_cast<fd_set*>(&readSet)))
-    return true;
-
-  return ReceiveMsg() != -1;
-}
-
-bool ChatClient::HandleReadyWriters(const fd_set& writeSet)
-{
-  if (!FD_ISSET(m_socket, const_cast<fd_set*>(&writeSet)))
-    return true;
-
-  return SendMsg() != -1;
-}
-
-// 0 - peer closed connection
-// 1 - no data right now
-// -1 - error occured
-int ChatClient::ReceiveMsg()
-{
-  char buf[RECV_BUF];
-
-  for (int reads = 0; reads < MAX_READS_PER_TICK; ++reads)
-  {
-    int bytes = ::recv(m_socket, buf, sizeof(buf), 0);
-
-    if (bytes == 0)
+    if (it.off < it.data.size())
     {
-      cout << "Server closed the connection.\n";
-      return 0;
+      needKick = true;
     }
-
-    if (bytes < 0)
+    else
     {
-      if (IsWouldBlock())
-        return 1;
-
-      cerr << "An error occured on reading message from Server\n";
-      return -1; // Error
+      m_sendQueue.pop_front();
+      needKick = !m_sendQueue.empty();
+      if (!needKick) m_sendInFlight = false;
     }
-
-    std::string msg(buf, bytes);
-    cout << msg;
   }
 
-  return 1;
-}
-
-void ChatClient::EnqueueSend(std::string line)
-{
-  if (line.empty() || line.back() != '\n')
-    line.push_back('\n');
-
-  m_sendQ.push_back({ std::move(line), 0 });
-}
-
-int ChatClient::SendMsg()
-{
-  if (m_socket == INVALID_SOCKET)
-    return -1;
-
-  if (m_sendQ.empty())
-    return 1; // nothing to send
-
-  Pending& front = m_sendQ.front();
-  const char* p = front.data.data() + front.ofs;
-  int remaining = static_cast<int>(front.data.size() - front.ofs);
-
-  int n = send(m_socket, p, remaining, 0);
-  if (n > 0)
-  {
-    front.ofs += n;
-
-    if (front.ofs == front.data.size())
-      m_sendQ.pop_front(); // fully sended
-
-    return 1;
-  }
-
-  if (n == 0)
-    return 1; // transient, try later
-
-  // n < 0
-  if (IsWouldBlock())
-    return 1; // not ready now; will retry when writable again
-
-  cerr << "send() failed, err=" << WSAGetLastError() << "\n";
-  return -1;
+  if (needKick)
+    KickSend();
 }

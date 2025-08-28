@@ -1,51 +1,54 @@
-#include <iostream>
-#include <thread>
-#include <atomic>
-
 #include "ChatClient.h"
+
+
+#include <thread>
+#include <iostream>
+#include <string>
+#include <memory>
+
 
 #pragma comment(lib, "Ws2_32.lib")
 
+
 int main(int argc, char* argv[])
 {
-  // Loopback localhost by default
-  const char* ipadd = "127.0.0.1";
   const char* port = "27015";
-
+  const char* ip = "127.0.0.1";
   if (argc > 1) port = argv[1];
-  if (argc > 2) ipadd = argv[2];
+  if (argc > 2) ip = argv[2];
 
-  try 
+
+  try
   {
-    ChatClient cli(ipadd, port);
+    auto cli = std::make_shared<ChatClient>(ip, port);
 
-    // Start a tiny input thread: read lines and queue them for sending.
-    std::atomic<bool> inputRun{ true };
-    std::thread input([&] 
-      {
-      std::string line;
-      while (inputRun && std::getline(std::cin, line)) 
-      {
-        if (line == "/quit") 
-        {
-          cli.Stop();
-          break;
-        }
-        cli.EnqueueSend(line);
-      }
+
+    std::thread netThread([&] {
+      cli->Start();
       });
 
-    cli.Start();
 
-    // Ensure input thread finishes
-    inputRun = false;
-    if (input.joinable()) 
-      input.join();
+    std::string line;
+    while (std::getline(std::cin, line))
+    {
+      if (line == "/quit")
+      {
+        cli->Stop();
+        break;
+      }
+      if (!line.empty())
+        line.push_back('\n');
+      cli->Send(line);
+    }
+
+
+    if (netThread.joinable())
+      netThread.join();
   }
-  catch (const std::exception& ex) {
-    std::cout << "Exception occurred: " << ex.what() << "\n";
+  catch (const std::exception& ex)
+  {
+    std::cerr << "Exception: " << ex.what() << "\n";
     return 1;
   }
-
   return 0;
 }
