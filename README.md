@@ -1,4 +1,11 @@
-# WinSocket
+# Sockets mini guide
+
+**Table of contents:**  
+- [Common Steps](#common-steps)
+- [Blocking sockets](#blocking-sockets)
+- [select](#select)
+- [Windows.WSAPoll](#wsapoll)
+- [Windows.IOCP](#iocp)
 
 ## Common Steps
 
@@ -46,10 +53,10 @@ Error handling: `WSAGetLastError()`
 **Pros:** very simple.
 **Cons:** poor scalability — one thread per client.
 
-## select (I/O multiplexing)
+## select
   
 **Idea:**  
-Monitor multiple sockets for read/write/exception readiness.  
+Monitor multiple sockets for read/write/exception readiness. I/O multiplexing)  
   
 **Steps:**
 1. Initialize sockets as usual.
@@ -65,9 +72,9 @@ Optional timeout: `timeval tv{sec, usec}` (or NULL for infinite)
 **Pros:** works in one thread.  
 **Cons:** limited (FD_SETSIZE ~64 on Windows by default), O(n) copy cost.  
   
-## WSAPoll (Windows poll)
+## WSAPoll
 **Idea:**  
-Poll an array of sockets (WSAPOLLFD[]) for events.  
+Poll an array of sockets (WSAPOLLFD[]) for events. Windows poll  
   
 **Steps:**
 1. Non-blocking sockets: `ioctlsocket(FIONBIO)`
@@ -81,5 +88,32 @@ For each fd:
 `POLLERR/POLLHUP` -> close  
   
 **Pros:** easier than select, no FD_SETSIZE limit.  
-**Cons:** still O(n) scan; not as scalable as IOCP.
-
+**Cons:** still O(n) scan; not as scalable as IOCP.  
+  
+## IOCP
+**Idea:**
+Asynchronous I/O with completion notifications. Threads wait on the completion port;
+operations are posted and completed asynchronously. I/O Completion Ports.  
+  
+**Steps:**
+1. Create completion port `HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);`
+2. Create sockets (overlapped): `WSASocket(..., WSA_FLAG_OVERLAPPED)`
+3. Associate sockets with IOCP: `CreateIoCompletionPort((HANDLE)sock, iocp, (ULONG_PTR)key, 0);`
+4. Load extension functions `WSAIoctl(..., SIO_GET_EXTENSION_FUNCTION_POINTER, &WSAID_ACCEPTEX, ...)` -> `AcceptEx`
+5. Worker Threads: Usually create ~2 x CPU threads.
+6. Post operations:  
+Pre-post `AcceptEx` with a new socket and `OVERLAPPED` structure  
+For active connections: `WSARecv` and `WSASend` with `OVERLAPPED`  
+7. Worker loop:  
+`GetQueuedCompletionStatus(iocp, &bytes, &key, &pOv, INFINITE)`  
+Handle `AcceptEx` completion:  
+Call `setsockopt(..., SO_UPDATE_ACCEPT_CONTEXT, ...)`  
+Associate new client socket with IOCP  
+Start `WSARecv` on it  
+Post another AcceptEx on listen socket  
+8. Shutdown  
+Post exit signals: `PostQueuedCompletionStatus(iocp, 0, 0, NULL)`  
+Close sockets, free buffers, `CloseHandle(iocp)`  
+  
+**Pros:** highest scalability, suited for tens of thousands of clients.
+**Cons:** most complex — requires careful memory and lifecycle management.

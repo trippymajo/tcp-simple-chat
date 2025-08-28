@@ -154,7 +154,7 @@ void ChatServer::Stop()
   if (m_iocp)
   {
     CloseHandle(m_iocp);
-    m_iocp == nullptr;
+    m_iocp = nullptr;
   }
 
   WSACleanup();
@@ -355,8 +355,8 @@ void ChatServer::OnAcceptComplete(AcceptCtx* ctx, DWORD /*bytes*/, bool ok)
 
   // Create session, associate with IOCP (key = session ptr), post first recv
   auto sess = std::make_unique<ClientSession>(as, this);
-  AssociateHandle((HANDLE)as, reinterpret_cast<ULONG_PTR>(sess.get()));
-  if (!sess->PostRecv())
+  bool bAssociated = AssociateHandle((HANDLE)as, reinterpret_cast<ULONG_PTR>(sess.get()));
+  if (!bAssociated || !sess->PostRecv())
   {
     sess->Stop();
     delete ctx;
