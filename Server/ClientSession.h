@@ -2,7 +2,6 @@
 
 #include <string>
 #include <deque>
-#include <winsock2.h>
 
 #include "Shared.h"
 
@@ -14,25 +13,24 @@ class ChatServer;
 class ClientSession
 {
 public:
-  ClientSession(SOCKET socket, ChatServer* server);
+  ClientSession(int& socket, ChatServer* server);
   ~ClientSession();
 
   void Stop();
-  bool PostRecv();
-  bool PostSend(const std::string& msg);
 
-  SOCKET GetSocket() const { return m_socket; }
+  bool IsWantSend() { return !m_sendQueue.empty(); }
 
-  // Exposed to server's completion loop:
-  OvEx   m_ovRecv;
-  OvEx   m_ovSend;
-  WSABUF m_recvBufWsa{};
-  char   m_recvBuf[64 * 1024]{};
+  bool Read();
+  bool Write();
 
-  std::deque<std::string> m_sendQueue;
-  bool m_sendInFlight = false;
+  void PostSend(const std::string& msg);
 
 private:
-  SOCKET      m_socket = INVALID_SOCKET;
-  ChatServer* m_server = nullptr;
+  void GracefulShutdown();
+
+private:
+  int m_socket;
+  ChatServer* m_server;
+
+  std::deque<std::string> m_sendQueue;
 };

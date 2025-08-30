@@ -1,6 +1,8 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <memory>
+
 #include "ChatServer.h"
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -31,8 +33,8 @@ int main(int argc, char* argv[])
 
   try
   {
-    ChatServer server(ipadds, port);
-    server.Start();
+    auto pServer = std::make_unique<ChatServer>(ipadds, port);
+    pServer->Start();
   }
   catch (const std::exception& ex)
   {

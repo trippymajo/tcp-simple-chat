@@ -12,6 +12,7 @@
 # Studio files
 *.vcxproj.user
 .vs/
+.vscode/
 
 #Build results
 Debug/

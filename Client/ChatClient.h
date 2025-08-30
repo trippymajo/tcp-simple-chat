@@ -8,10 +8,7 @@
 #include <thread>
 #include <condition_variable>
 
-
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include "../include/Shared.h"
+#include "Shared.h"
 
 
 struct SendItem

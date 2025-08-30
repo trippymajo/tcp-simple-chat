@@ -1,21 +1,17 @@
 #include "ClientSession.h"
 #include "ChatServer.h"
 
-#include <stdexcept>
-#include <cstring>
+#include <sys/socket.h> // socket(), bind(), connect(), listen(), accept()
+#include <unistd.h>     // close()
 
+constexpr int RECV_BUF = 4096;
 
-ClientSession::ClientSession(SOCKET socket, ChatServer* server)
-  : m_socket(socket), m_server(server)
-{
-  std::memset(&m_ovRecv, 0, sizeof(m_ovRecv));
-  std::memset(&m_ovSend, 0, sizeof(m_ovSend));
-  m_ovRecv.kind = OvEx::Kind::Recv;
-  m_ovSend.kind = OvEx::Kind::Send;
+//
+// === ClientSession functions ===
+//
 
-  m_recvBufWsa.buf = m_recvBuf;
-  m_recvBufWsa.len = sizeof(m_recvBuf);
-}
+ClientSession::ClientSession(int& sfd, ChatServer* server)
+  : m_socket(sfd), m_server(server) {}
 
 ClientSession::~ClientSession()
 {
@@ -24,50 +20,111 @@ ClientSession::~ClientSession()
 
 void ClientSession::Stop()
 {
-  if (m_socket != INVALID_SOCKET)
+  if (m_socket != -1)
   {
-    shutdown(m_socket, SD_BOTH);
-    closesocket(m_socket);
-    m_socket = INVALID_SOCKET;
+    GracefulShutdown();
+    close(m_socket);
+    m_socket = -1;
   }
 }
 
-bool ClientSession::PostRecv()
+void ClientSession::GracefulShutdown()
 {
-  DWORD flags = 0;
-  DWORD ignored = 0;
-  std::memset(&m_ovRecv.ov, 0, sizeof(m_ovRecv.ov));
-  m_ovRecv.kind = OvEx::Kind::Recv;
+  shutdown(m_socket, SHUT_WR);
 
-  int rc = WSARecv(m_socket, &m_recvBufWsa, 1, &ignored, &flags, &m_ovRecv.ov, nullptr);
-  if (rc == 0) return true;
-  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING) return true;
-  return false;
+  char buf[RECV_BUF];
+  while (true)
+  {
+    ssize_t bytes = recv(m_socket, buf, static_cast<size_t>(RECV_BUF), 0);
+
+    // peer closed connection
+    if (bytes == 0)
+      break;
+
+    // Error occured
+    if (bytes < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        break;
+      }
+
+      std::perror("recv");
+      break;
+    }
+  }
 }
 
-bool ClientSession::PostSend(const std::string& msg)
+bool ClientSession::Read()
 {
-  if (msg.empty()) return true;
+  char buf[RECV_BUF];
+  while (true)
+  {
 
-  m_sendQueue.push_back(msg);
-  if (m_sendInFlight) return true;
+    ssize_t bytes = recv(m_socket, buf, static_cast<size_t>(RECV_BUF), 0);
 
-  m_sendInFlight = true;
+    // peer closed connection
+    if (bytes == 0) return false;
 
-  std::memset(&m_ovSend.ov, 0, sizeof(m_ovSend.ov));
-  m_ovSend.kind = OvEx::Kind::Send;
+    // Error occured
+    if (bytes < 0)
+    {
+      // Stream of recv fully read
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        return true;
+      }
 
-  WSABUF wsa{};
-  wsa.buf = const_cast<char*>(m_sendQueue.front().data());
-  wsa.len = static_cast<ULONG>(m_sendQueue.front().size());
+      std::perror("recv");
+      return false;
+    }
 
-  DWORD ignored = 0;
-  int rc = WSASend(m_socket, &wsa, 1, &ignored, 0, &m_ovSend.ov, nullptr);
-  if (rc == 0) return true;
-  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING) return true;
+    std::string msg(buf, buf + bytes);
+    m_server->BroadcastMsg(msg, this);
+  }
+}
 
-  // Immediate failure
-  m_sendInFlight = false;
-  m_sendQueue.pop_front();
-  return false;
+bool ClientSession::Write()
+{
+  while (!m_sendQueue.empty())
+  {
+    std::string& msg = m_sendQueue.front();
+    ssize_t bytes = send(m_socket, msg.c_str(), msg.size(), 0);
+
+    // peer closed connection
+    if (bytes == 0) return false;
+
+    // Error occured
+    if (bytes < 0)
+    {
+      // Stream of recv fully read or try again later
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        return true;
+      }
+
+      std::perror("send");
+      return false;
+    }
+
+    // Half part of msg was sent
+    if (bytes < static_cast<ssize_t>(msg.size()))
+    {
+      msg.erase(0, static_cast<size_t>(bytes));
+      return true; // Return for Server to call Write again later
+    }
+
+    m_sendQueue.pop_front();
+  }
+
+  // All was read and send queue is free to go
+  return true;
+}
+
+void ClientSession::PostSend(const std::string& msg)
+{
+  if (!msg.empty()) 
+  {
+    m_sendQueue.push_back(msg);
+  }
 }
