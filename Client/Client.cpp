@@ -1,14 +1,9 @@
 #include "ChatClient.h"
 
-
 #include <thread>
 #include <iostream>
 #include <string>
 #include <memory>
-
-
-#pragma comment(lib, "Ws2_32.lib")
-
 
 int main(int argc, char* argv[])
 {
@@ -22,11 +17,10 @@ int main(int argc, char* argv[])
   {
     auto cli = std::make_shared<ChatClient>(ip, port);
 
-
-    std::thread netThread([&] {
-      cli->Start();
+    std::thread netThread([&] 
+      {
+        cli->Start();
       });
-
 
     std::string line;
     while (std::getline(std::cin, line))

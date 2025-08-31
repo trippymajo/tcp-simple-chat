@@ -11,4 +11,4 @@ Client.cpp
 )
 
 #Exe
-ADD_EXECUTABLE(Client Client.cpp)
+ADD_EXECUTABLE(Client ${SOURCES})

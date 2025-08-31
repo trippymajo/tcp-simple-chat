@@ -14,4 +14,4 @@ Server.cpp
 )
 
 #Exe
-ADD_EXECUTABLE(Server Server.cpp)
+ADD_EXECUTABLE(Server ${SOURCES})

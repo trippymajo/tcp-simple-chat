@@ -2,313 +2,286 @@
 
 #include <iostream>
 #include <cstring>
+#include <vector>
+
+#include <sys/socket.h> // socket(), bind(), connect(), listen(), accept()
+#include <unistd.h>     // close()
+#include <netinet/in.h> // sockaddr_in, htons, htonl
+#include <arpa/inet.h>  // inet_ntop()
+#include <netdb.h>      // getaddrinfo(), freeaddrinfo()
+#include <fcntl.h>      // fcntl()
 
 using std::cout;
 using std::cerr;
 
-static void SafeCloseSocket(SOCKET& s)
+constexpr int RECV_BUF = 4096;
+constexpr int TIMEOUT_MS = 1000; // 1s timeout fo poll
+
+//
+// === UTILS ===
+//
+
+static void SafeCloseSocket(int& sfd)
 {
-  if (s != INVALID_SOCKET)
+  if (sfd != -1)
   {
-    closesocket(s);
-    s = INVALID_SOCKET;
+    close(sfd);
+    sfd = -1;
   }
 }
 
-ChatClient::ChatClient(const char* ipadd, const char* port)
-  : m_ipadd(ipadd), m_port(port)
+/// <summary>
+/// Sets file descriptor to non-blocking mode.
+/// </summary>
+static bool SetNonBlocking(int& sfd)
 {
-  m_recvBufWsa.buf = m_recvStorage;
-  m_recvBufWsa.len = static_cast<ULONG>(sizeof(m_recvStorage));
+    int flags = fcntl(sfd, F_GETFL, 0);
+    if (flags == -1)
+    {
+      return false;
+    }
+
+    if (fcntl(sfd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+      return false;
+    }
+
+    return true;
+}
+
+//
+// === ChatClient functions ===
+//
+
+ChatClient::ChatClient(const char* ipadd, const char* port)
+  : m_ip(ipadd), m_port(port) 
+{
+  // may be this
+  // memset(&m_poll, 0, sizeof(m_poll));
 }
 
 ChatClient::~ChatClient()
 {
   Stop();
-  if (m_sendThread.joinable())
-    m_sendThread.join();
 }
 
 void ChatClient::Start()
 {
-  WSADATA wsa{};
-  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+  if (!CreateConnection())
   {
-    cerr << "WSAStartup failed\n";
-    return;
-  }
-
-  if (!InitIocp() || !CreateConnection() || !AssociateHandle())
-  {
+    cerr << "Failed to establish connection to "
+        << m_ip << ":" << m_port << "\n";
     Stop();
     return;
   }
 
-  m_isActive = true;
-
-  if (!PostRecv())
+  if (!SetNonBlocking(m_socket))
   {
-    cerr << "Initial WSARecv failed\n";
+    cerr << "Failed to make socket non blocking";
     Stop();
     return;
   }
 
-  m_runSend = true;
-  m_sendThread = std::thread([this] { SendWorker(); });
+  m_running.store(true, std::memory_order::memory_order_release);
 
-  RunEventLoop();
+  RunLoop();
   Stop();
 }
 
 void ChatClient::Stop()
 {
-  m_runSend = false;
-  m_sendCv.notify_all();
+  cout << "Closing the connection\n";
+  cout << "Type /quit to quit";
+  m_running.store(false, std::memory_order::memory_order_release);
 
-  if (m_socket != INVALID_SOCKET)
-    shutdown(m_socket, SD_BOTH);
+  if (m_socket == -1)
+    return;
 
+  shutdown(m_socket, SHUT_WR);
   SafeCloseSocket(m_socket);
-
-  if (m_isActive)
-  {
-    WSACleanup();
-    m_isActive = false;
-  }
-
-  if (m_sendThread.joinable())
-    m_sendThread.join();
-}
-
-bool ChatClient::InitIocp()
-{
-  m_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
-  return m_iocp != nullptr;
 }
 
 bool ChatClient::CreateConnection()
 {
-  addrinfo hints{}, * result;
+  addrinfo hints, *result;
+  memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_protocol = IPPROTO_TCP;
 
-  if (getaddrinfo(m_ipadd.c_str(), m_port.c_str(), &hints, &result) != 0)
+  if (getaddrinfo(m_ip, m_port, &hints, &result) != 0)
   {
-    cerr << "Cant resolve address for " << m_ipadd << ":" << m_port << "\n";
+    cerr << "Cant resolve address for " << m_ip << ":" << m_port << "\n";
     return false;
   }
 
+  // Try connect
   for (addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next)
   {
-    SOCKET s = WSASocket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol,
-      nullptr, 0, WSA_FLAG_OVERLAPPED);
-    if (s == INVALID_SOCKET)
-      continue;
+    int sfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+    if (sfd == -1) continue;
 
-    if (!ConnectToServer(s, ptr))
+    if (connect(sfd, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen)) != 0)
     {
-      SafeCloseSocket(s);
+      SafeCloseSocket(sfd);
       continue;
     }
 
-    m_socket = s;
-    freeaddrinfo(result);
-    return true;
+    m_socket = sfd;
+    break;
   }
 
   freeaddrinfo(result);
-  return false;
+
+  return m_socket != -1;
 }
 
-bool ChatClient::ConnectToServer(SOCKET socket, addrinfo* pInfo)
+void ChatClient::RunLoop()
 {
-  if (socket == INVALID_SOCKET)
-    return false;
+  CreatePoll();
 
-  if (connect(socket, pInfo->ai_addr, static_cast<int>(pInfo->ai_addrlen)) != 0)
-    return false;
-
-  return true;
-}
-
-bool ChatClient::AssociateHandle()
-{
-  return (CreateIoCompletionPort((HANDLE)m_socket, m_iocp, (ULONG_PTR)m_socket, 0) == m_iocp);
-}
-
-bool ChatClient::PostSend(const std::string& msg)
-{
-  if (msg.empty())
-    return true;
-
-  std::lock_guard<std::mutex> lg(m_sendMx);
-  m_sendQueue.push_back(SendItem{ msg, 0 });
-
-  if (m_sendInFlight)
-    return true;
-
-  m_sendInFlight = true;
-  return KickSend();
-}
-
-bool ChatClient::KickSend()
-{
-  std::lock_guard<std::mutex> lg(m_sendMx);
-  if (m_sendQueue.empty())
+  while (m_running.load(std::memory_order::memory_order_acquire))
   {
-    m_sendInFlight = false;
-    return true;
-  }
+    SetPollEvents();
 
-  if (m_socket == INVALID_SOCKET)
-  {
-    m_sendInFlight = false;
-    m_sendQueue.clear();
-    return false;
-  }
+    int ready = poll(&m_poll, 1, TIMEOUT_MS);
 
-  SendItem& it = m_sendQueue.front();
-
-  std::memset(&it.ov.ov, 0, sizeof(it.ov.ov));
-  it.ov.kind = OvEx::Kind::Send;
-
-  WSABUF wsa{};
-  wsa.buf = const_cast<char*>(it.data.data() + it.off);
-  wsa.len = static_cast<ULONG>(it.data.size() - it.off);
-
-  DWORD ignored = 0;
-  int rc = WSASend(m_socket, &wsa, 1, &ignored, 0, &it.ov.ov, nullptr);
-
-  if (rc == 0)
-    return true;
-
-  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING)
-    return true;
-
-  m_sendInFlight = false;
-  m_sendQueue.pop_front();
-  return false;
-}
-
-bool ChatClient::PostRecv()
-{
-  std::memset(&m_ovRecv.ov, 0, sizeof(m_ovRecv.ov));
-  m_ovRecv.kind = OvEx::Kind::Recv;
-
-  DWORD flags = 0, ig = 0;
-  int rc = WSARecv(m_socket, &m_recvBufWsa, 1, &ig, &flags, &m_ovRecv.ov, nullptr);
-  if (rc == 0)
-    return true;
-  if (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING)
-    return true;
-
-  return false;
-}
-
-bool ChatClient::Send(const std::string& msg)
-{
-  if (msg.empty())
-    return true;
-
-  {
-    std::lock_guard<std::mutex> lg(m_sendMx);
-    m_sendQueue.push_back(SendItem{ msg, 0 });
-  }
-  m_sendCv.notify_one();
-  return true;
-}
-
-void ChatClient::SendWorker()
-{
-  while (m_runSend)
-  {
-    std::unique_lock<std::mutex> lk(m_sendMx);
-    m_sendCv.wait(lk, [&] { return !m_sendQueue.empty() || !m_runSend; });
-
-    if (!m_runSend) break;
-    if (!m_sendInFlight && !m_sendQueue.empty())
+    if (ready == -1) 
     {
-      m_sendInFlight = true;
-      lk.unlock();
-      KickSend();
-    }
-  }
-}
-
-void ChatClient::RunEventLoop()
-{
-  while (m_isActive)
-  {
-    DWORD bytes = 0;
-    ULONG_PTR key = 0;
-    LPOVERLAPPED pov = nullptr;
-
-    BOOL ok = GetQueuedCompletionStatus(m_iocp, &bytes, &key, &pov, INFINITE);
-
-    if (!pov)
+      if (errno == EINTR) continue; // Interrupted. Retry.
+      perror("poll");
       break;
-
-    auto* ex = reinterpret_cast<OvEx*>(pov);
-    switch (ex->kind)
-    {
-    case OvEx::Kind::Recv: OnRecvComplete(bytes, ok != FALSE); break;
-    case OvEx::Kind::Send: OnSendComplete(bytes, ok != FALSE); break;
     }
+
+    // None ready, continue asking for readiness
+    if (ready == 0) continue;
+
+    if (!HandleConnection())
+      break;
   }
 }
 
-void ChatClient::OnRecvComplete(DWORD bytes, bool ok)
+void ChatClient::CreatePoll()
 {
-  if (!ok || bytes == 0)
-  {
-    cout << "Server closed connection\n";
-    SafeCloseSocket(m_socket);
-    if (m_iocp)
-      PostQueuedCompletionStatus(m_iocp, 0, 0, nullptr);
-    return;
-  }
-
-  std::string msg(m_recvStorage, m_recvStorage + bytes);
-  cout << msg;
-
-  PostRecv();
+  memset(&m_poll, 0, sizeof(m_poll));
+  m_poll.fd = m_socket;
+  m_poll.events = POLLIN;
 }
 
-void ChatClient::OnSendComplete(DWORD bytes, bool ok)
+void ChatClient::SetPollEvents()
 {
-  if (!ok)
+  bool isEmpty = false;
+  { // If something in send make it signal about it
+    std::lock_guard<std::mutex>lg(m_sendMutex);
+    isEmpty = m_sendQueue.empty();
+  }
+
+  isEmpty 
+    ? m_poll.events &= ~POLLOUT
+    : m_poll.events |= POLLOUT;
+}
+
+bool ChatClient::HandleConnection()
+{
+  if (m_poll.revents & (POLLERR | POLLHUP | POLLNVAL))
   {
-    SafeCloseSocket(m_socket);
-    if (m_iocp)
-      PostQueuedCompletionStatus(m_iocp, 0, 0, nullptr);
+    return false;
+  }
+
+  if (m_poll.revents & POLLIN)
+  {
+    if (!Read())
+    {
+      return false;
+    }
+  }
+
+  if (m_poll.revents & POLLOUT)
+  {
+    if (!Write())
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool ChatClient::Read()
+{
+  char buf[RECV_BUF];
+
+  while (true)
+  {
+    ssize_t bytes = recv(m_socket, buf, static_cast<size_t>(RECV_BUF), 0);
+
+    // peer closed connection
+    if (bytes == 0) return false;
+
+    // Error occured
+    if (bytes < 0)
+    {
+      // Stream of recv fully read
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        return true;
+      }
+
+      std::perror("recv");
+      return false;
+    }
+
+    std::string msg(buf, buf + bytes);
+    cout << msg;
+  }
+}
+
+bool ChatClient::Write()
+{
+  std::lock_guard<std::mutex>lg(m_sendMutex);
+
+  while (!m_sendQueue.empty())
+  {
+    std::string& msg = m_sendQueue.front();
+    ssize_t bytes = send(m_socket, msg.c_str(), msg.size(), MSG_NOSIGNAL);
+
+    // peer closed connection
+    if (bytes == 0) return false;
+
+    // Error occured
+    if (bytes < 0)
+    {
+      // Stream of recv fully read or try again later
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        return true;
+      }
+
+      std::perror("send");
+      return false;
+    }
+
+    // Half part of msg was sent
+    if (bytes < static_cast<ssize_t>(msg.size()))
+    {
+      msg.erase(0, static_cast<size_t>(bytes));
+      return true; // Return for Server to call Write again later
+    }
+
+    m_sendQueue.pop_front();
+  }
+
+  // All was read and send queue is free to go
+  return true;
+}
+
+void ChatClient::Send(const std::string& msg)
+{
+  if (msg.empty())
     return;
-  }
 
-  bool needKick = false;
   {
-    std::lock_guard<std::mutex> lg(m_sendMx);
-    if (m_sendQueue.empty())
-    {
-      m_sendInFlight = false;
-      return;
-    }
-
-    SendItem& it = m_sendQueue.front();
-    it.off += bytes;
-
-    if (it.off < it.data.size())
-    {
-      needKick = true;
-    }
-    else
-    {
-      m_sendQueue.pop_front();
-      needKick = !m_sendQueue.empty();
-      if (!needKick) m_sendInFlight = false;
-    }
+    std::lock_guard<std::mutex> lg(m_sendMutex);
+    m_sendQueue.push_back(msg);
   }
-
-  if (needKick)
-    KickSend();
 }

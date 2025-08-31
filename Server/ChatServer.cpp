@@ -17,7 +17,7 @@ using std::cout;
 using std::cerr;
 
 constexpr int MAX_LISTEN = 64; // backlog (Num of clients)
-constexpr int TIMEOUT_MS = 3000; // 3s timeout fo poll
+constexpr int TIMEOUT_MS = 1000; // 3s timeout fo poll
 
 //
 // === UTILS ===
