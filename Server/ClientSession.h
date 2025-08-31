@@ -3,8 +3,6 @@
 #include <string>
 #include <deque>
 
-#include "Shared.h"
-
 class ChatServer;
 
 /// <summary>
