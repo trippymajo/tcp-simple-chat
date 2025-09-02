@@ -17,7 +17,7 @@ using std::cout;
 using std::cerr;
 
 constexpr int MAX_LISTEN = 64; // backlog (Num of clients)
-constexpr int TIMEOUT_MS = 1000; // 3s timeout fo poll
+constexpr int MAX_EVENTS = 1024;
 
 //
 // === UTILS ===
@@ -116,7 +116,7 @@ void ChatServer::Start()
     {
       if (SetNonBlocking(sfd))
       {
-        m_listenSockets.push_back(sfd);
+        m_listenSockets.insert(sfd);
       }
     }
   }
@@ -125,6 +125,21 @@ void ChatServer::Start()
   {
     cerr << "Failed to create listening sockets\n";
     return;
+  }
+
+  // Init epoll
+  m_epoll = epoll_create1(EPOLL_CLOEXEC);
+  if (m_epoll < 0)
+  {
+    perror("epoll_create1");
+    Stop();
+    return;
+  }
+
+  // Fill epoll with listeners
+  for (const auto& lsfd : m_listenSockets)
+  {
+    AddListenToEpoll(lsfd);
   }
 
   m_running = true;
@@ -156,11 +171,17 @@ void ChatServer::Stop()
   m_clients.clear();
 
   // Close listeners
-  for (auto& s : m_listenSockets)
+  for (auto s : m_listenSockets)
   {
     SafeCloseSocket(s);
   }
   m_listenSockets.clear();
+
+  if (m_epoll != -1) 
+  { 
+    close(m_epoll); 
+    m_epoll = -1; 
+  }
 
   m_running = false;
 }
@@ -192,10 +213,6 @@ int ChatServer::CreateListenSocket(const std::string& ip)
     int sfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
     if (sfd == -1) continue;
 
-    // On Windows, prefer EXCLUSIVEADDRUSE to avoid port hijacking semantics.
-    //bool on = TRUE;
-    //setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&on), sizeof(on));
-
     if (bind(sfd, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen)) == -1)
     {
       SafeCloseSocket(sfd);
@@ -219,66 +236,46 @@ int ChatServer::CreateListenSocket(const std::string& ip)
   return retVal;
 }
 
-/// <summary>Top-level select() loop broken into clear steps.</summary>
-void ChatServer::RunLoop()
+void ChatServer::AddListenToEpoll(const int& lsocket)
 {
-  std::vector<pollfd> pfds;
-  pfds.reserve(m_listenSockets.size() + 128);
-
-  while (m_running)
+  epoll_event ev{};
+  ev.events = EPOLLIN; // LT is OK for listen sockets
+  ev.data.fd = lsocket;
+  if (epoll_ctl(m_epoll, EPOLL_CTL_ADD, lsocket, &ev) < 0)
   {
-    RebuildPollSet(pfds);
-
-    int ready = poll(pfds.data(), pfds.size(), TIMEOUT_MS);
-
-    if (ready == -1) 
-    {
-      if (errno == EINTR) continue; // Interrupted. Retry.
-      perror("poll");
-      break;
-    }
-
-    // None ready, continue asking for readiness
-    if (ready == 0) 
-      continue;
-
-    HandleListeners(pfds);
-
-    HandleClients(pfds);
+    perror("epoll_ctl ADD listen");
   }
 }
 
-void ChatServer::RebuildPollSet(std::vector<pollfd>&pollfds)
+/// <summary>Top-level select() loop broken into clear steps.</summary>
+void ChatServer::RunLoop()
 {
-  pollfds.clear();
-  pollfds.reserve(m_listenSockets.size() + m_clients.size());
+   std::vector<epoll_event> events(MAX_EVENTS);
 
-  // Listeners
-  for (const auto& lsfd : m_listenSockets)
+  while (m_running)
   {
-    pollfd pfd;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = lsfd;
-    pfd.events = POLLIN;
-
-    pollfds.push_back(pfd);
-  }
-
-  // Clients
-  for (const auto& cli : m_clients)
-  {
-    pollfd pfd;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = cli.first;
-    pfd.events = POLLIN;
-
-    // Find sockets with not empty buf to send
-    if (cli.second && cli.second->IsWantSend())
-    {
-      pfd.events |= POLLOUT;
+    int n = epoll_wait(m_epoll, events.data(), static_cast<int>(events.size()), -1);
+    if (n < 0)
+    { // dont need to continue on 0, cos it is impossible to return such.
+      if (errno == EINTR) continue; // Interrupted. Retry.
+      perror("epoll_wait");
+      break;
     }
 
-    pollfds.push_back(pfd);
+    for (int i = 0; i < n; ++i)
+    {
+      int fd = events[i].data.fd; // why copy?
+      uint32_t ev = events[i].events; // why copy?
+      
+        // is event Listener?
+      if (m_listenSockets.count(fd) > 0)
+      {
+        HandleListeners(fd, ev);
+        continue;
+      }
+
+      HandleClients(fd, ev);
+    }
   }
 }
 
@@ -286,75 +283,93 @@ void ChatServer::RebuildPollSet(std::vector<pollfd>&pollfds)
 // === Handlers ===
 //
 
-void ChatServer::HandleListeners(std::vector<pollfd>&pollfds)
+void ChatServer::HandleListeners(int& sfd, uint32_t& event)
 {
-  for (size_t i = 0; i < m_listenSockets.size(); i++)
+  if (event & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
   {
-    auto& pPollfd = pollfds[i];
+    cerr << "Listener fd = " << sfd << "error/hup/nval\n";
+    m_running = false;
+    return;
+  }
 
-    if (pPollfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+  if (event & EPOLLIN) 
+  {
+    AcceptAll(sfd);  // drain accept() to EAGAIN
+  }
+}
+
+void ChatServer::HandleClients(int& sfd, uint32_t& event)
+{
+  // Errors / hangups first
+  if (event & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+  {
+    CloseClient(sfd);
+    return;
+  }
+
+  auto it = m_clients.find(sfd);
+  if (it == m_clients.end()) return;
+  auto& sess = it->second;
+
+  // Readable
+  if (event & EPOLLIN)
+  {
+    if (!sess->Read())
     {
-      cerr << "Listener fd = " << pPollfd.fd << "error/hup/nval\n";
-      m_running = false;
+      CloseClient(sfd);
+      return;
+    }
+  }
+
+  // Writable
+  if (event & EPOLLOUT)
+  {
+    if (!sess->Write())
+    {
+      CloseClient(sfd);
       return;
     }
 
-    if (pPollfd.revents & POLLIN)
+    // If queue is empty now — drop EPOLLOUT to avoid busy wakeups
+    if (!sess->IsWantSend())
     {
-      AcceptAll(pPollfd.fd);
+      ModClientWritable(sfd, false);
     }
   }
 }
-
-void ChatServer::HandleClients(std::vector<pollfd>&pollfds)
-{
-  for (size_t i = m_listenSockets.size(); i < pollfds.size(); ++i)
-  {
-    auto& pfd = pollfds[i];
-
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-    {
-      CloseClient(pfd.fd);
-      continue;
-    }
-
-    auto it = m_clients.find(pfd.fd);
-    if (it == m_clients.end())
-    {
-      continue;
-    }
-
-    auto& sess = it->second;
-    if (pfd.revents & POLLIN)
-    {
-      if (!sess->Read())
-      {
-        CloseClient(pfd.fd);
-        continue;
-      }
-    }
-
-    if (pfd.revents & POLLOUT)
-    {
-      if (!sess->Write())
-      {
-        CloseClient(pfd.fd);
-        continue;
-      }
-    }
-  }
-}
-
 
 //
 // === Handlers' helpers ===
 //
 
-void ChatServer::AcceptAll(int& pfd)
+void ChatServer::AddClientToEpoll(const int& clsocket)
+{
+  epoll_event ev{};
+  ev.data.fd = clsocket;
+  ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // ET for clients
+
+  auto it = m_clients.find(clsocket);
+  if (it == m_clients.end())
+  {
+    return;
+  }
+
+  if (it->second->IsWantSend())
+  {
+   ev.events |= EPOLLOUT;
+  }
+
+  if (epoll_ctl(m_epoll, EPOLL_CTL_ADD, clsocket, &ev) < 0)
+  {
+    perror("epoll_ctl ADD client");
+  }
+}
+
+void ChatServer::AcceptAll(int& fd)
 {
   while (true)
   {
-    int cs = accept(pfd, nullptr, nullptr);
+    int cs = accept4(fd, nullptr, nullptr, SOCK_NONBLOCK);
 
     if (cs == -1)
     {
@@ -364,18 +379,17 @@ void ChatServer::AcceptAll(int& pfd)
         break;
       }
 
-      std::perror("accept");
+      std::perror("accept4");
       break;
     }
-
-    SetNonBlocking(cs);
 
     // Optional greeting
     static const char* hello = "Welcome to the chat!\n";
     send(cs, hello, strlen(hello), MSG_NOSIGNAL);
 
-    // Save in clients
+    // Save in clients, add to epoll
     m_clients.emplace(cs, std::make_unique<ClientSession>(cs, this));
+    AddClientToEpoll(cs);
 
     // Log peer address
     sockaddr addr;
@@ -387,6 +401,28 @@ void ChatServer::AcceptAll(int& pfd)
       cout << "Client connected: ";
       PrintSockaddr(&addr);
     }
+  }
+}
+
+void ChatServer::ModClientWritable(int fd, const bool& enable)
+{
+  auto it = m_clients.find(fd);
+  if (it == m_clients.end()) return;
+
+  // Base mask for clients under ET
+  uint32_t mask = EPOLLIN | EPOLLRDHUP | EPOLLET;
+  if (enable)
+  {
+    mask |= EPOLLOUT;
+  }
+
+  epoll_event ev{};
+  ev.data.fd = fd;
+  ev.events  = mask;
+
+  if (epoll_ctl(m_epoll, EPOLL_CTL_MOD, fd, &ev) < 0)
+  {
+    perror("epoll_ctl MOD client");
   }
 }
 
@@ -402,6 +438,10 @@ void ChatServer::CloseClient(int& sfd)
     m_clients.erase(it);
   }
 
+  // remove socket from epoll just incase
+  if (m_epoll != -1)
+    epoll_ctl(m_epoll, EPOLL_CTL_DEL, sfd, nullptr);
+
   SafeCloseSocket(sfd);
 }
 
@@ -411,7 +451,11 @@ void ChatServer::BroadcastMsg(const std::string& msg, ClientSession* pSender)
   {
     const auto& s = cli.second;
     if (s && s.get() != pSender)
+    {
       s->PostSend(msg);
+      // Ensure we get notified to flush
+      ModClientWritable(cli.first, true);
+    }
   }
 
   cout << "Message broadcasted:" << msg << "\n";

@@ -4,15 +4,12 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
-#include <sys/poll.h>   // poll()
+#include <sys/epoll.h>   // epoll()
 
 class ClientSession;
 
-/// <summary>
-/// Chat server that accepts TCP connections and multiplexes client I/O using select().
-/// Owns all ClientSession instances and broadcasts incoming messages to other clients.
-/// </summary>
 class ChatServer
 {
 public:
@@ -28,21 +25,25 @@ private:
   int CreateListenSocket(const std::string& ip);
   void RunLoop();
 
-  void RebuildPollSet(std::vector<pollfd>&pollfds);
-  void HandleListeners(std::vector<pollfd>&pollfds);
-  void HandleClients(std::vector<pollfd>&pollfds);
+  void HandleListeners(int& sfd, uint32_t& event);
+  void HandleClients(int& sfd, uint32_t& event);
 
-  void AcceptAll(int& pfd);
+  void AddListenToEpoll(const int& lsocket);
+  void AddClientToEpoll(const int& clsocket);
+
+  void AcceptAll(int& fd);
   void CloseClient(int& sfd);
+  void ModClientWritable(int fd, const bool& enable);
   bool ReadClient(int& sfd);
   bool WriteClient(int& sfd);
 
 
 private:
   bool m_running = false;
+  int m_epoll = -1;
   std::string m_port;
   std::vector<std::string> m_ips;
 
-  std::vector<int> m_listenSockets;
+  std::unordered_set<int> m_listenSockets;
   std::unordered_map<int, std::unique_ptr<ClientSession>> m_clients;
 };

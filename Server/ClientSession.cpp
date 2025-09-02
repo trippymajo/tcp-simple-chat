@@ -89,7 +89,7 @@ bool ClientSession::Write()
   while (!m_sendQueue.empty())
   {
     std::string& msg = m_sendQueue.front();
-    ssize_t bytes = send(m_socket, msg.c_str(), msg.size(), 0);
+    ssize_t bytes = send(m_socket, msg.c_str(), msg.size(), MSG_NOSIGNAL);
 
     // peer closed connection
     if (bytes == 0) return false;
