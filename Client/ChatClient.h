@@ -6,7 +6,7 @@
 #include <atomic>
 #include <thread>
 
-#include <sys/poll.h>   // poll()
+#include <sys/epoll.h>   // poll()
 
 class ChatClient
 {
@@ -24,10 +24,11 @@ private:
   bool CreateConnection();
   void RunLoop();
 
-  void CreatePoll();
-  void SetPollEvents();
-  bool HandleConnection();
+  void CreateEpoll();
+  void AddSockToEpoll();
+  bool HandleConnection(uint32_t& ev);
 
+  void ModWritable(const bool& enable);
   bool Read();
   bool Write();
 
@@ -37,7 +38,7 @@ private:
 
   std::atomic<bool> m_running {false};
   int m_socket = -1;
-  pollfd m_poll;
+  int m_epoll = -1;
 
   std::mutex m_sendMutex;
   std::deque<std::string> m_sendQueue;

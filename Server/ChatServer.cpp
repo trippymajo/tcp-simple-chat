@@ -344,7 +344,8 @@ void ChatServer::HandleClients(int& sfd, uint32_t& event)
 
 void ChatServer::AddClientToEpoll(const int& clsocket)
 {
-  epoll_event ev{};
+  epoll_event ev;
+  memset(&ev, 0, sizeof(ev));
   ev.data.fd = clsocket;
   ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // ET for clients
 

@@ -15,7 +15,7 @@ using std::cout;
 using std::cerr;
 
 constexpr int RECV_BUF = 4096;
-constexpr int TIMEOUT_MS = 1000; // 1s timeout fo poll
+constexpr int MAX_EVENTS = 16; // more than enough for single fd
 
 //
 // === UTILS ===
@@ -54,11 +54,7 @@ static bool SetNonBlocking(int& sfd)
 //
 
 ChatClient::ChatClient(const char* ipadd, const char* port)
-  : m_ip(ipadd), m_port(port) 
-{
-  // may be this
-  // memset(&m_poll, 0, sizeof(m_poll));
-}
+  : m_ip(ipadd), m_port(port) {}
 
 ChatClient::~ChatClient()
 {
@@ -82,7 +78,10 @@ void ChatClient::Start()
     return;
   }
 
-  m_running.store(true, std::memory_order::memory_order_release);
+  m_running.store(true, std::memory_order_release);
+
+  CreateEpoll();
+  AddSockToEpoll(); 
 
   RunLoop();
   Stop();
@@ -95,10 +94,22 @@ void ChatClient::Stop()
   m_running.store(false, std::memory_order::memory_order_release);
 
   if (m_socket == -1)
+  {
+    if (m_epoll != -1) 
+    { 
+      close(m_epoll); m_epoll = -1; 
+    }
     return;
+  }
 
   shutdown(m_socket, SHUT_WR);
   SafeCloseSocket(m_socket);
+
+  if (m_epoll != -1)
+  {
+    close(m_epoll);
+    m_epoll = -1;
+  }
 }
 
 bool ChatClient::CreateConnection()
@@ -136,59 +147,62 @@ bool ChatClient::CreateConnection()
   return m_socket != -1;
 }
 
+void ChatClient::CreateEpoll()
+{
+  m_epoll = epoll_create1(EPOLL_CLOEXEC);
+  if (m_epoll < 0)
+  {
+    perror("epoll_create1");
+  }
+}
+
 void ChatClient::RunLoop()
 {
-  CreatePoll();
+  std::vector<epoll_event> events(MAX_EVENTS);
 
   while (m_running.load(std::memory_order::memory_order_acquire))
   {
-    SetPollEvents();
-
-    int ready = poll(&m_poll, 1, TIMEOUT_MS);
-
-    if (ready == -1) 
+    int n = epoll_wait(m_epoll, events.data(), (int)events.size(), -1);
+    if (n < 0)
     {
-      if (errno == EINTR) continue; // Interrupted. Retry.
-      perror("poll");
+      if (errno == EINTR) continue;
+      perror("epoll_wait");
       break;
     }
 
-    // None ready, continue asking for readiness
-    if (ready == 0) continue;
-
-    if (!HandleConnection())
-      break;
+    for (int i = 0; i < n; ++i)
+    {
+      uint32_t ev = events[i].events;
+      if (!HandleConnection(ev))
+      {
+        m_running.store(false, std::memory_order::memory_order_release);
+        break;
+      }
+    }
   }
 }
 
-void ChatClient::CreatePoll()
+void ChatClient::AddSockToEpoll()
 {
-  memset(&m_poll, 0, sizeof(m_poll));
-  m_poll.fd = m_socket;
-  m_poll.events = POLLIN;
-}
+  epoll_event ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.data.fd = m_socket;
+  ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
 
-void ChatClient::SetPollEvents()
-{
-  bool isEmpty = false;
-  { // If something in send make it signal about it
-    std::lock_guard<std::mutex>lg(m_sendMutex);
-    isEmpty = m_sendQueue.empty();
+  if (epoll_ctl(m_epoll, EPOLL_CTL_ADD, m_socket, &ev) < 0)
+  {
+    perror("epoll_ctl ADD client-sock");
   }
-
-  isEmpty 
-    ? m_poll.events &= ~POLLOUT
-    : m_poll.events |= POLLOUT;
 }
 
-bool ChatClient::HandleConnection()
+bool ChatClient::HandleConnection(uint32_t& ev)
 {
-  if (m_poll.revents & (POLLERR | POLLHUP | POLLNVAL))
+  if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
   {
     return false;
   }
 
-  if (m_poll.revents & POLLIN)
+  if (ev & EPOLLIN)
   {
     if (!Read())
     {
@@ -196,12 +210,17 @@ bool ChatClient::HandleConnection()
     }
   }
 
-  if (m_poll.revents & POLLOUT)
+  if (ev & EPOLLOUT)
   {
     if (!Write())
     {
       return false;
     }
+
+    // If queue is empty no need to epollout still be raised
+    std::lock_guard<std::mutex> lg(m_sendMutex);
+    if (m_sendQueue.empty())
+      ModWritable(false);
   }
 
   return true;
@@ -265,7 +284,9 @@ bool ChatClient::Write()
     if (bytes < static_cast<ssize_t>(msg.size()))
     {
       msg.erase(0, static_cast<size_t>(bytes));
-      return true; // Return for Server to call Write again later
+     // Still something to send? 
+      ModWritable(true);
+      return true;
     }
 
     m_sendQueue.pop_front();
@@ -283,5 +304,33 @@ void ChatClient::Send(const std::string& msg)
   {
     std::lock_guard<std::mutex> lg(m_sendMutex);
     m_sendQueue.push_back(msg);
+  }
+
+  // Trigger sending event
+  ModWritable(true);
+}
+
+void ChatClient::ModWritable(const bool& enable)
+{
+  if (m_epoll == -1 || m_socket == -1)
+  { 
+    return;
+  }
+
+  uint32_t event = EPOLLIN | EPOLLRDHUP | EPOLLET;
+  {
+    std::lock_guard<std::mutex> lg(m_sendMutex);
+    if (enable && !m_sendQueue.empty())
+    {
+      event |= EPOLLOUT;
+    }
+  }
+
+  epoll_event ev{};
+  ev.data.fd = m_socket;
+  ev.events  = event;
+  if (epoll_ctl(m_epoll, EPOLL_CTL_MOD, m_socket, &ev) < 0)
+  {
+    perror("epoll_ctl MOD client-sock");
   }
 }
