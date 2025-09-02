@@ -6,9 +6,10 @@
 - [select](#select)
 - [Windows.WSAPoll](#wsapoll)
 - [Windows.IOCP](#iocp)
+- [POSIX.poll](#poll)
 
 ## Common Steps
-
+  
 1. **Initialize Winsock**
 Startup: `WSAStartup(...), WSACleanup()`
 > [!IMPORTANT]
@@ -32,7 +33,7 @@ Close: `shutdown(sock, SD_SEND/SD_BOTH) -> closesocket(sock)`
 Error handling: `WSAGetLastError()`  
   
 ## Blocking sockets
-
+  
 **Client:**
 1. `WSAStartup`
 2. `getaddrinfo(server, port, …)`
@@ -91,7 +92,7 @@ For each fd:
 **Cons:** still O(n) scan; not as scalable as IOCP.  
   
 ## IOCP
-**Idea:**
+**Idea:**  
 Asynchronous I/O with completion notifications. Threads wait on the completion port;
 operations are posted and completed asynchronously. I/O Completion Ports.  
   
@@ -116,4 +117,48 @@ Post exit signals: `PostQueuedCompletionStatus(iocp, 0, 0, NULL)`
 Close sockets, free buffers, `CloseHandle(iocp)`  
   
 **Pros:** highest scalability, suited for tens of thousands of clients.
-**Cons:** most complex — requires careful memory and lifecycle management.
+**Cons:** most complex — requires careful memory and lifecycle management.  
+  
+# poll
+**Idea:**  
+I/O multiplexing with an array of struct `pollfd`. More scalable than select, no `FD_SETSIZE` limit.
+
+**Steps:**  
+1. Create sockets and make them non-blocking `fcntl(fd, F_SETFL, O_NONBLOCK)`
+2. Fill an array/vector of `pollfd`:  
+`pollfd.fd = sock`  
+`pollfd.events = POLLIN | POLLOUT | POLLERR | POLLHUP`
+3. Loop:  
+`poll(fds, count, timeout_ms)`  
+`POLLIN` -> accept/recv  
+`POLLOUT` -> send pending data, then disable `POLLOUT` if queue is empty  
+`POLLERR/POLLHUP` -> close the socket  
+  
+**Pros:** Works on all POSIX systems, No `FD_SETSIZE` limitation like `select`  
+**Cons:** Still O(n) scan each iteration. Rebuild array after removing/closing sockets  
+  
+# epoll
+**Idea:**  
+Efficient Linux-specific API. The kernel tracks socket interests and returns only ready fds.  
+  
+**Level-Triggered (LT) vs Edge-Triggered (ET):**  
+**LT:** simpler, events keep firing until you consume all data  
+**ET:** more efficient, but you must drain accept/recv/send fully to `EAGAIN`  
+  
+**Steps:**  
+1. Non-blocking sockets: `fcntl(fd, F_SETFL, O_NONBLOCK)`
+2. Create epoll instance: `epoll_create1(EPOLL_CLOEXEC)`
+3. Add sockets:  
+`epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev  
+`ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`
+4. Loop:  
+`epoll_wait(ep, events, maxevents, timeout)`  
+For each event:  
+On listen socket: accept in a loop until `EAGAIN`  
+On client socket:  
+`EPOLLIN` -> recv in loop until `EAGAIN`  
+`EPOLLOUT` -> flush pending sends, disable `EPOLLOUT` when empty  
+`EPOLLRDHUP/EPOLLHUP/EPOLLERR` -> close/remove  
+  
+**Pros:** Much better scalability for thousands of socket, Only ready sockets are returned, no full scan.  
+**Cons:** Linux only, Edge-triggered mode requires careful loops and buffering
