@@ -154,7 +154,7 @@ Efficient Linux-specific API. The kernel tracks socket interests and returns onl
 4. Loop:  
 `epoll_wait(ep, events, maxevents, timeout)`  
 For each event:  
-On listen socket: accept in a loop until `EAGAIN`  
+On listen socket: `accept4()` in a loop until `EAGAIN`  
 On client socket:  
 `EPOLLIN` -> recv in loop until `EAGAIN`  
 `EPOLLOUT` -> flush pending sends, disable `EPOLLOUT` when empty  
