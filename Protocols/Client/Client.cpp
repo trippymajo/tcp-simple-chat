@@ -1,4 +1,5 @@
 #include <iostream>
+#include <memory>
 #include "ChatClient.h"
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -17,8 +18,8 @@ int main(int argc, char* argv[])
 
   try
   {
-    ChatClient cli(ipadd, port);
-    cli.Run();
+    auto cli = std::make_unique<ChatClient>(ipadd, port);
+    cli->Run();
   }
   catch (const std::exception& ex)
   {
