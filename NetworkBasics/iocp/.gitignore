@@ -1,0 +1,37 @@
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Studio files
+*.vcxproj.user
+.vs/
+
+#Build results
+Debug/
+Release/
+x64/
+*.obj
+*.pdb
+*.idb
+*.ipch
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.sdf
+*.opensdf
+*.cache
+*.db
+*.VC.db
+
+# Executables
+*.exe
+*.out
+*.app
