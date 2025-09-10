@@ -95,7 +95,7 @@ bool recv_frame(SOCKET s, std::string& out)
     return false;
   uint32_t size = ntohl(nsize);
 
-  // DoS protection
+  // RX: DoS protection (AKA Sanity check)
   const uint32_t MAX_PAYLOAD = 1024u * 1024u; // 1 MB
   if (size > MAX_PAYLOAD)
     return false;
