@@ -1,5 +1,6 @@
 #include "ClientSession.h"
 #include "ChatServer.h"
+#include "../Shared/Framing.h"
 
 #include "WS2tcpip.h"
 
@@ -50,41 +51,26 @@ void ClientSession::GracefulShutdown()
   setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, 
     reinterpret_cast<const char*>(&RECV_TIMEOUT), sizeof(RECV_TIMEOUT));
 
-  char buf[RECV_BUF];
-  while (recv(m_socket, buf, sizeof(buf), 0) > 0) { /* Do nothing */ }
+  string msg;
+  recv_frame(m_socket, msg);
 }
 
 void ClientSession::SendMsg(const string& msg)
 {
   std::lock_guard<std::mutex> lock(m_sendMutex);
 
-  const char* ptr = msg.data();
-  size_t size = msg.size();
-
-  while (size > 0)
-  {
-    int sent = send(m_socket, ptr, static_cast<int>(size), 0);
-
-    if (sent <= 0)
-      break;
-
-    ptr += sent;
-    size -= static_cast<size_t>(sent);
-  }
+  send_frame(m_socket, msg);
 }
 
 void ClientSession::ReceiveMsg()
 {
-  char buf[RECV_BUF];
+  string msg;
 
   while (m_active.load(std::memory_order_acquire))
   {
-    int bytes = recv(m_socket, buf, sizeof(buf), 0);
-
-    if (bytes <= 0)
+    if (!recv_frame(m_socket, msg))
       break;
 
-    std::string msg(buf, bytes);
     m_server->BroadcastMsg(msg, this);
   }
 }

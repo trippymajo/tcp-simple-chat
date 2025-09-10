@@ -64,7 +64,7 @@ static bool send_all(SOCKET s, const char* data, int len, int flags)
 // === FRAMING API ===
 //
 
-static bool send_frame(SOCKET s, const std::string& payload)
+bool send_frame(SOCKET s, const std::string& payload)
 {
   if (payload.empty())
     return false;
@@ -85,7 +85,7 @@ static bool send_frame(SOCKET s, const std::string& payload)
   return true;
 }
 
-static bool recv_frame(SOCKET s, std::string& out)
+bool recv_frame(SOCKET s, std::string& out)
 {
   out.clear();
 

@@ -3,6 +3,8 @@
 #include "ChatClient.h"
 #include "ws2tcpip.h"
 
+#include "../Shared/Framing.h"
+
 using std::cin;
 using std::cout;
 using std::thread;
@@ -21,21 +23,16 @@ ChatClient::ChatClient(const char* ipadd, const char* port)
 
 void ChatClient::ReceiveMessages()
 {
-  char buf[1024];
+  std::string msg;
 
   while (m_isActive.load(std::memory_order_acquire))
   {
-    int bytes = recv(m_socket, buf, sizeof(buf) - 1, 0);
-
-    if (bytes <= 0)
+    if (!recv_frame(m_socket, msg))
     {
       cout << "Server disconnected. Press Enter to exit.\n";
       m_isActive = false;
       break;
     }
-
-    buf[bytes] = '\0';
-    string msg(buf, bytes);
 
     cout << msg << "\n";
   }
@@ -50,19 +47,7 @@ void ChatClient::SendMessages()
       break;
 
     // read num of bytes sent, and do send all untill the full message sent
-
-    const char* ptr = msg.data();
-    size_t size = msg.size();
-    while (size > 0)
-    {
-      int sent = send(m_socket, ptr, static_cast<int>(size), 0);
-
-      if (sent <= 0)
-        break;
-
-      ptr += sent;
-      size -= static_cast<size_t>(sent);
-    }
+    send_frame(m_socket, msg);
   }
 }
 

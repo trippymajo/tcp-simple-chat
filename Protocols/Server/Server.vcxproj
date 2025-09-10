@@ -127,11 +127,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\Shared\Framing.cpp" />
     <ClCompile Include="ChatServer.cpp" />
     <ClCompile Include="ChatServer.h" />
     <ClCompile Include="ClientSession.cpp" />
     <ClCompile Include="ClientSession.h" />
     <ClCompile Include="Server.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Shared\Framing.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
