@@ -13,6 +13,11 @@ enum class RxOverflowMode
   DropNewest, DropOldest, DisconnectOnOverflow
 };
 
+enum class TxOverflowMode
+{
+  BlockProducer, DropNewest, DropOldest, DisconnectOnOverflow
+};
+
 class ChatClient
 {
 public:
@@ -26,6 +31,8 @@ private:
   void ReceiveMessages();
   void Disconnect();
   void SendMessages();
+  bool TxEnqueueMessage(std::string msg);
+  void CinMessages();
   void GracefulShutDown();
 
 private:
@@ -35,11 +42,20 @@ private:
   SOCKET m_socket;
 
   // RX
-  std::mutex m_mtxQueue;
-  std::condition_variable m_cvQueue;
+  std::mutex m_rxMutex;
+  std::condition_variable m_rxCV;
   std::queue<std::string> m_rxQueue;
   RxOverflowMode m_rxMode = RxOverflowMode::DropNewest;
 
+  // TX
+  std::mutex m_txMutex;
+  std::condition_variable m_txNotEmpty;
+  std::condition_variable m_txNotFull;
+  size_t m_txBytesQueued = 0;
+  std::queue<std::string> m_txQueue;
+  TxOverflowMode m_txMode = TxOverflowMode::BlockProducer;
+
   std::thread m_print;
   std::thread m_recv;
+  std::thread m_send;
 };

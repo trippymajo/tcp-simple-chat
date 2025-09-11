@@ -11,6 +11,8 @@ using std::thread;
 using std::mutex;
 using std::string;
 
+constexpr size_t TX_HWM = 1024u * 1024u; // 1 MB
+constexpr size_t TX_LWM = 512u * 1024u; // 0.5 MB
 constexpr unsigned int MAX_RX_QUEUE_SIZE = 500;
 constexpr int RECV_TIMEOUT = 3000; // ms
 
@@ -27,8 +29,8 @@ void ChatClient::PrintMessages()
   string msg;
   while (true)
   {
-    std::unique_lock<mutex>lock(m_mtxQueue);
-    m_cvQueue.wait(lock, [&]
+    std::unique_lock<mutex>lock(m_rxMutex);
+    m_rxCV.wait(lock, [&]
     {
       return !m_isActive.load(std::memory_order_acquire) || !m_rxQueue.empty();
     });
@@ -54,12 +56,12 @@ void ChatClient::ReceiveMessages()
     {
       cout << "Server disconnected. Press Enter to exit.\n";
       m_isActive.store(false, std::memory_order_release);
-      m_cvQueue.notify_all(); // unsleep printer
+      m_rxCV.notify_all(); // unsleep printer
       break;
     }
 
     {
-      std::unique_lock<std::mutex>lock(m_mtxQueue);
+      std::unique_lock<std::mutex>lock(m_rxMutex);
 
       bool wouldOverflowMsgs = (static_cast<unsigned int>(m_rxQueue.size()) >= MAX_RX_QUEUE_SIZE);
       if (wouldOverflowMsgs)
@@ -75,20 +77,20 @@ void ChatClient::ReceiveMessages()
               m_rxQueue.pop();
             }
             m_rxQueue.push(std::move(msg));
-            m_cvQueue.notify_all();
+            m_rxCV.notify_all();
             break;
 
           case RxOverflowMode::DisconnectOnOverflow:
             m_isActive.store(false, std::memory_order_release);
             lock.unlock();
-            m_cvQueue.notify_all();
+            m_rxCV.notify_all();
             return;
         }
       }
       else
       {
         m_rxQueue.push(std::move(msg));
-        m_cvQueue.notify_all();
+        m_rxCV.notify_all();
       }
     }
   }
@@ -96,14 +98,111 @@ void ChatClient::ReceiveMessages()
 
 void ChatClient::SendMessages()
 {
+  while (true)
+  {
+    std::string msg;
+
+    {
+      std::unique_lock<std::mutex> lock(m_txMutex);
+      m_txNotEmpty.wait(lock, [&] 
+      {
+        return !m_isActive.load(std::memory_order_acquire) || !m_txQueue.empty();
+      });
+
+      if (!m_isActive.load(std::memory_order_acquire) && m_txQueue.empty())
+        break;
+
+      msg = std::move(m_txQueue.front());
+      m_txBytesQueued -= msg.size();
+      m_txQueue.pop();
+
+      // if we have size to recieve new messages in queue for sending
+      if (m_txBytesQueued <= TX_LWM)
+        m_txNotFull.notify_all();
+    }
+
+    if (!send_frame(m_socket, msg)) 
+    {
+      m_isActive.store(false, std::memory_order_release);
+      m_txNotEmpty.notify_all();
+      m_txNotFull.notify_all();
+      return;
+    }
+  }
+}
+
+bool ChatClient::TxEnqueueMessage(std::string msg)
+{
+  std::unique_lock<std::mutex>lock(m_txMutex);
+
+  size_t msgSize = msg.size();
+
+  auto wouldOverflowMsgs = [&]()
+    {
+      return (m_txBytesQueued + msgSize) > TX_HWM;
+    };
+
+  if (m_txMode == TxOverflowMode::BlockProducer)
+  {
+    m_txNotFull.wait(lock, [&]()
+      {
+        return !m_isActive.load(std::memory_order_acquire) ||
+          (m_txBytesQueued <= TX_LWM && !wouldOverflowMsgs());
+      });
+
+    if (!m_isActive.load(std::memory_order_acquire))
+      return false;
+  }
+  else if (wouldOverflowMsgs())
+  {
+    switch (m_txMode)
+    {
+      case TxOverflowMode::DropNewest:
+        return false;
+
+      case TxOverflowMode::DropOldest:
+        while (!m_txQueue.empty() && wouldOverflowMsgs()) 
+        {
+          m_txBytesQueued -= m_txQueue.front().size();
+          m_txQueue.pop();
+        }
+        break;
+
+      case TxOverflowMode::DisconnectOnOverflow:
+        m_isActive.store(false, std::memory_order_release);
+        m_txNotEmpty.notify_all();
+        return false;
+
+      default: break;
+    }
+  }
+
+  const bool was_empty = m_txQueue.empty();
+  m_txQueue.push(std::move(msg));
+  m_txBytesQueued += msgSize;
+
+  if (was_empty)
+    m_txNotEmpty.notify_all();
+
+  return true;
+}
+
+void ChatClient::CinMessages()
+{
   string msg;
   while (std::getline(cin, msg))
   {
     if (!m_isActive.load(std::memory_order_acquire))
       break;
 
-    // read num of bytes sent, and do send all untill the full message sent
-    send_frame(m_socket, msg);
+    if (msg.size() > TX_HWM)
+    {
+      cout << "Message is too heavy. Skipped.\n";
+      break;
+    }
+
+    if (!TxEnqueueMessage(std::move(msg)))
+      break;
   }
 }
 
@@ -159,11 +258,13 @@ void ChatClient::Run()
 
   m_recv = thread(&ChatClient::ReceiveMessages, this);
   m_print = thread(&ChatClient::PrintMessages, this);
+  m_send = thread(&ChatClient::SendMessages, this);
 
-  SendMessages();
+  CinMessages();
 
   Disconnect();
   m_recv.join();
+  m_send.join();
   m_print.join();
 
   WSACleanup();
@@ -185,8 +286,10 @@ void ChatClient::GracefulShutDown()
 void ChatClient::Disconnect()
 {
   m_isActive.store(false, std::memory_order_release);
-  m_cvQueue.notify_all();
+  m_rxCV.notify_all();
 
+  m_txNotEmpty.notify_all();
+  m_txNotFull.notify_all();
 
   if (m_socket != INVALID_SOCKET)
   {
