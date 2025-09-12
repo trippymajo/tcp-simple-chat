@@ -74,10 +74,12 @@ void ChatServer::Stop()
   }
   m_acceptThreads.clear();
 
-  std::lock_guard<std::mutex> lock(m_clientsMutex);
-  for (auto& c : m_clients)
-    c->Stop();
-  m_clients.clear();
+  {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (auto& c : m_clients)
+      c->Stop();
+    m_clients.clear();
+  }
 
   WSACleanup();
 }
@@ -176,13 +178,19 @@ void ChatServer::AcceptClients(SOCKET socket)
 
 void ChatServer::BroadcastMsg(const std::string& msg, ClientSession* pSender)
 {
-  std::lock_guard<std::mutex> lock(m_clientsMutex);
-
-  for (const auto& pClient : m_clients)
+  std::vector<std::shared_ptr<ClientSession>> snapshot;
   {
-    if (pClient && pClient.get() != pSender)
-      pClient->SendMsg(msg);
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    snapshot.reserve(m_clients.size());
+    for (const auto& pClient : m_clients)
+    {
+      if (pClient && pClient.get() != pSender)
+        snapshot.push_back(pClient);
+    }
   }
 
-  cout << "Message broadcated:" << msg << "\n";
+  for (const auto& pClient : snapshot)
+    pClient->SendMsg(msg);
+
+  std::cout << "Message broadcated:" << msg << "\n";
 }

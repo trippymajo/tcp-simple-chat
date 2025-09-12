@@ -5,6 +5,8 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 
 #include "winsock2.h"
 
@@ -18,17 +20,28 @@ public:
 
   void Start();
   void Stop();
-  void SendMsg(const std::string& msg);
+  void SendMsg(const std::string& msg); 
+  void SendMsg(std::string&& msg);
 
 private:
-  void ReceiveMsg();
+  void RecvLoop();
+  void SendLoop();
   void GracefulShutdown();
 
 private:
   SOCKET m_socket;
   ChatServer* m_server;
 
+  // TX backpressure
+  std::thread m_txThread;
+  std::mutex m_txMutex;
+  std::condition_variable m_txNotEmpty;
+  std::condition_variable m_txNotFull;
+  std::deque<std::string> m_txQueue;
+  size_t m_txBytesQueued = 0;
+
+  // RX
+  std::thread m_rxThread;
+
   std::atomic<bool> m_active;
-  std::thread m_thread;
-  std::mutex m_sendMutex;
 };
