@@ -142,6 +142,9 @@ I/O multiplexing with an array of struct `pollfd`. More scalable than select, no
 **Idea:**  
 Efficient Linux-specific API. The kernel tracks socket interests and returns only ready fds.  
   
+**EPOLLONESHOT**  
+Freezes fd core until first modifications with `EPOLL_CTL_MOD` in `epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev)`. Use like: `ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT`. This avoids race when threads can work with the same socket.  
+  
 **Level-Triggered (LT) vs Edge-Triggered (ET):**  
 **LT:** simpler, events keep firing until you consume all data  
 **ET:** more efficient, but you must drain accept/recv/send fully to `EAGAIN`  

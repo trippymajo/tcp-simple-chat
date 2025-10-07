@@ -264,10 +264,10 @@ void ChatServer::RunLoop()
 
     for (int i = 0; i < n; ++i)
     {
-      int fd = events[i].data.fd; // why copy?
-      uint32_t ev = events[i].events; // why copy?
-      
-        // is event Listener?
+      int fd = events[i].data.fd;
+      uint32_t ev = events[i].events;
+
+      // Accept first for ET
       if (m_listenSockets.count(fd) > 0)
       {
         HandleListeners(fd, ev);
@@ -347,7 +347,7 @@ void ChatServer::AddClientToEpoll(const int& clsocket)
   epoll_event ev;
   memset(&ev, 0, sizeof(ev));
   ev.data.fd = clsocket;
-  ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET; // ET for clients
+  ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT; // ET for clients with ONESHOT which freezes fd
 
   auto it = m_clients.find(clsocket);
   if (it == m_clients.end())
@@ -411,7 +411,7 @@ void ChatServer::ModClientWritable(int fd, const bool& enable)
   if (it == m_clients.end()) return;
 
   // Base mask for clients under ET
-  uint32_t mask = EPOLLIN | EPOLLRDHUP | EPOLLET;
+  uint32_t mask = EPOLLIN | EPOLLRDHUP | EPOLLET | EPOLLONESHOT;
   if (enable)
   {
     mask |= EPOLLOUT;
